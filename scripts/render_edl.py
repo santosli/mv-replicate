@@ -2,57 +2,66 @@
 """Render an edit decision list (EDL JSON) into an MV with ffmpeg.
 
 EDL fields (relative paths resolve against --root, default: the current directory; ~ is expanded):
-  song, duration, size [w, h], fps, grade (ffmpeg filter for footage, optional),
-  loudness {I, TP} (optional; flat gain + peak limiter, audio rendered to WAV then muxed), end_fade (s), work_dir, out
+  song, duration, size [w, h] (even), fps (number or "num/den"), grade (ffmpeg filter for footage, optional),
+  loudness {I, TP} (optional; gain + oversampled peak limiter, measured on the final AAC), end_fade (s),
+  work_dir (parent for temporary run folders), out (final file), avoid {path: [[start, end), ...]} (optional),
+  qa {loudness_I_tol, true_peak_tol, sync_ms} (optional tolerances)
   segments: contiguous list covering [0, duration]; each
     {at, dur, src | color, from | end, speed=1,
      layout="full" | {frame: "vertical", pos, bg, slide} | {frame: "photo", bg, scale, rot},
      flash_in=0, shake=0, punch=0, reverse=false, duotone=[shadow, (mid,) highlight], zoom=[z0, z1],
      focus=[fx, fy], freeze=false, rot=deg, whip_in=s, whip_out=s, wipe_in={src, from, dur}, note}
-    freeze holds the frame at `from`; rot is a dutch tilt; zoom [z, z] is a static cut-in aimed at focus;
-    whip_in / whip_out smear the frame sideways at the start / end; wipe_in reveals this shot over
-    another clip (src at from) with a paint-drip mask.
-    "end" anchors the source end instead of the start: from = end - dur*speed.
+    Output frame k of a segment shows the source frame on screen at from + k * speed / fps
+    (references/conventions.md). freeze holds the frame on screen at `from`; reverse plays exactly
+    the selected frames backwards; "end" anchors the source end: from = end - dur * speed.
+    rot is a dutch tilt; zoom [z, z] is a static cut-in aimed at focus; whip_in / whip_out smear the
+    frame sideways; wipe_in reveals this shot over another clip (src at from) with a paint-drip mask.
   overlays: [{type: "text_slam" | "starburst" | "flash", at, dur, text, color, stroke, size, font}
              | {type: "text_pop", at, dur, out, pieces: [{text, at, x, y, rot, style?}], style: {font, size,
-                fill, fill2, stroke, stroke_w, stroke2, stroke2_w, shadow, glow, shear}, wobble: [t...], sparks,
-                pop, pop_from (>1: slams in oversized and settles), exit: "whip"}]
+                fill, fill2, stroke, stroke_w, stroke2, stroke2_w, shadow, glow, shear, marker}, wobble: [t...],
+                sparks, pop, pop_from (>1: slams in oversized and settles), exit: "whip"}]
              | {type: "layer", src: RGBA .mov (qtrle), at, dur}   e.g. a lyrics layer rendered elsewhere
-    text_pop times (pieces[].at, wobble, out) are absolute song seconds: put each piece on the
-    sung character (lyric_chars.py), not on the beat grid.
+    Overlay times are film seconds snapped to the output frame grid. text_pop times (pieces[].at,
+    wobble, out) are absolute film seconds: put each piece on the sung character (lyric_chars.py).
+    An overlay starting before 0 s keeps its own clock; the part before 0 s is cut off.
+
+Safety: the EDL is validated before anything is created. Each run works in a fresh folder inside
+work_dir and deletes only that folder. The film is written to a hidden candidate next to `out`,
+checked by qa_render, and only then published; an existing `out` is kept unless --replace.
+A report <out>.qa.json (or <out>.failed-<run>.qa.json) is written either way.
 
 Fonts: a piece's style `font`, else $MV_REPLICATE_FONT, else HarmonyOS Sans SC Black if installed.
-work_dir is deleted and recreated on every run: point it at a scratch folder.
 
-  python render_edl.py edl.json [--root DIR]
+  python render_edl.py edl.json [--root DIR] [--replace] [--keep-work] [--allow-loudness-miss]
 """
-import argparse, json, math, os, shutil, subprocess, sys
+import argparse, json, math, os, shutil, subprocess, sys, time
+from fractions import Fraction
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import mvr_common as M   # noqa: E402
+import validate_edl as V   # noqa: E402
+import qa_render as QA   # noqa: E402
 
 ROOT = Path.cwd()
 
 
 def default_font():
     """Body font: $MV_REPLICATE_FONT, else HarmonyOS Sans SC Black in a usual font folder."""
-    env = os.environ.get('MV_REPLICATE_FONT')
-    if env:
-        return Path(env).expanduser()
-    for d in ('~/Library/Fonts', '/Library/Fonts', '~/.local/share/fonts', '~/.fonts', '/usr/share/fonts/truetype'):
-        p = Path(d).expanduser() / 'HarmonyOS_Sans_SC_Black.ttf'
-        if p.exists():
-            return p
-    sys.exit('no default font: set MV_REPLICATE_FONT=/path/to/a/CJK/font.ttf or give "font" in the EDL style (see README)')
+    f = V.default_font()
+    if f is None:
+        raise M.MvrError('font', 'default font', 'set MV_REPLICATE_FONT=/path/to/a/CJK/font.ttf or give "font" in the EDL style (see README)')
+    return f
 
 
 def P(p):
-    p = Path(p).expanduser()
-    return p if p.is_absolute() else ROOT / p
+    return M.resolve_path(p, ROOT)
 
 
-def run(cmd):
-    r = subprocess.run(cmd, capture_output=True, text=True)
+def run(cmd, stage='ffmpeg'):
+    r = subprocess.run([str(c) for c in cmd], capture_output=True, text=True)
     if r.returncode:
-        sys.exit(f"ffmpeg failed: {' '.join(map(str, cmd))}\n{r.stderr[-2000:]}")
+        raise M.MvrError(stage, ' '.join(map(str, cmd))[:300], r.stderr.strip()[-1500:])
     return r
 
 
@@ -61,17 +70,9 @@ def hexrgb(h):
     return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
 
 
-def frames(t, fps):
-    return round(t * fps)
-
-
 def seg_filter(s, W, H, fps, grade):
-    speed = s.get('speed', 1.0)
-    f = [f'setpts=(PTS-STARTPTS)/{speed}', f'fps={fps}']
-    if s.get('freeze'):             # hold the frame at `from` for the whole segment (freeze-frame card)
-        f = ['trim=end_frame=1', 'setpts=PTS-STARTPTS', f"tpad=stop_mode=clone:stop_duration={s['dur'] + 0.2}", f'fps={fps}']
-    if s.get('reverse'):            # play the selected source range backwards
-        f.insert(0, 'reverse')
+    n = M.seg_frame_count(s, fps)
+    f = M.select_chain(P(s['src']), M.seg_source_start(s), n, fps, s.get('speed', 1), s.get('freeze'), s.get('reverse'))
     lay = s.get('layout', 'full')
     if lay == 'full':
         f += [f'scale={W}:{H}:force_original_aspect_ratio=increase:flags=lanczos', f'crop={W}:{H}']
@@ -184,39 +185,39 @@ def drip_mask(W, H, fps, n, d, out, seed=0):
 
 def render_segment(s, i, edl, work):
     W, H = edl['size']
-    fps = edl['fps']
-    n = frames(s['at'] + s['dur'], fps) - frames(s['at'], fps)
+    fps = M.frac(edl['fps'])
+    n = M.seg_frame_count(s, fps)
     out = work / f'seg{i:03d}.mp4'
     enc = ['-frames:v', str(n), '-an', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '16', '-pix_fmt', 'yuv420p', str(out)]
     if 'color' in s:
         run(['ffmpeg', '-v', 'error', '-y', '-f', 'lavfi', '-i', f"color=c={s['color']}:s={W}x{H}:r={fps}", *enc])
         return out, n
-    speed = s.get('speed', 1.0)
-    start = s['from'] if 'from' in s else s['end'] - s['dur'] * speed
-    need = s['dur'] * speed + 0.1
-    if s.get('freeze'):
-        need = 0.2
+    src = P(s['src'])
+    start = M.seg_source_start(s)
     chain = seg_filter(s, W, H, fps, edl.get('grade'))
     if s.get('wipe_in'):
-        # paint-drip wipe: this shot is revealed over the previous one by a procedurally drawn mask
+        # paint-drip wipe: this shot is revealed over another clip by a procedurally drawn mask
         wp = s['wipe_in']
-        mask = drip_mask(W, H, fps, n, wp.get('dur', 0.9), work / f'mask{i:03d}', seed=i)
-        a_chain = (f"setpts=PTS-STARTPTS,fps={fps},scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H}"
-                   + (f",{edl['grade']}" if edl.get('grade') else '') + f",tpad=stop_mode=clone:stop_duration={s['dur']}")
+        wsrc = P(wp['src'])
+        wd = wp.get('dur', 0.9)
+        wn = min(n, M.Q(wd, fps) + 1)
+        mask = drip_mask(W, H, fps, n, wd, work / f'mask{i:03d}', seed=i)
+        a_chain = ','.join(M.select_chain(wsrc, wp['from'], wn, fps)
+                           + [f'scale={W}:{H}:force_original_aspect_ratio=increase', f'crop={W}:{H}']
+                           + ([edl['grade']] if edl.get('grade') else []) + [f'tpad=stop_mode=clone:stop={n}'])
         graph = (f"{chain}[b];[1:v]{a_chain}[a];[2:v]format=gray[m];[b][m]alphamerge[bm];"
                  f"[a][bm]overlay=shortest=1,format=yuv420p")
-        run(['ffmpeg', '-v', 'error', '-y', '-ss', f'{max(start, 0):.4f}', '-t', f'{need:.4f}', '-i', str(P(s['src'])),
-             '-ss', f"{wp['from']:.4f}", '-t', f"{wp.get('dur', 0.9) + 0.1:.4f}", '-i', str(P(wp['src'])),
+        run(['ffmpeg', '-v', 'error', '-y', *M.source_args(src, start), *M.source_args(wsrc, wp['from']),
              '-framerate', str(fps), '-i', str(mask / '%05d.png'),
              '-filter_complex', graph + '[v]', '-map', '[v]', *enc])
         shutil.rmtree(mask)
     else:
-        run(['ffmpeg', '-v', 'error', '-y', '-ss', f'{max(start, 0):.4f}', '-t', f'{need:.4f}', '-i', str(P(s['src'])),
+        run(['ffmpeg', '-v', 'error', '-y', *M.source_args(src, start),
              '-filter_complex', chain + '[v]', '-map', '[v]', *enc])
     got = int(run(['ffprobe', '-v', 'error', '-count_frames', '-select_streams', 'v:0', '-show_entries',
                    'stream=nb_read_frames', '-of', 'csv=p=0', str(out)]).stdout.strip())
-    if got < n:
-        sys.exit(f"segment {i} ({s.get('note', '')}) is short: {got}/{n} frames; source runs out at {start + need:.2f}s")
+    if got != n:
+        raise M.MvrError('render', f"segment {i} ({s.get('note', '')})", f'rendered {got} frames, expected {n}')
     return out, n
 
 
@@ -339,20 +340,27 @@ def text_pop_frame(o, t_abs, W, H, sprites):
     return im
 
 
-def overlay_frames(o, W, H, fps, d):
+def overlay_span(o, fps):
+    """(first output frame, frame count, local frames skipped) on the output grid, clipped at 0."""
+    qa, qb = M.Q(o['at'], fps), M.Q(o['at'] + o['dur'], fps)
+    q0 = max(qa, 0)
+    return q0, qb - q0, q0 - qa
+
+
+def overlay_images(o, W, H, fps):
+    """Yield the overlay's RGBA frames for output frames q0..q0+n-1 (film time (q0 + k) / fps)."""
     from PIL import Image, ImageDraw, ImageFont
-    n = frames(o['dur'], fps)
-    d.mkdir(parents=True, exist_ok=True)
-    font = None
+    q0, n, skip = overlay_span(o, fps)
     if o['type'] == 'text_pop':
         sprites = [text_sprite(pc['text'], {**o['style'], **pc.get('style', {})}, H) for pc in o['pieces']]
         for k in range(n):
-            text_pop_frame(o, o['at'] + k / fps, W, H, sprites).save(d / f'{k:05d}.png')
-        return n
+            yield text_pop_frame(o, float(Fraction(q0 + k) / fps), W, H, sprites)
+        return
+    font = None
     if o['type'] == 'text_slam':
         font = ImageFont.truetype(str(P(o['font']) if o.get('font') else default_font()), int(H * o.get('size', 0.42)))
     for k in range(n):
-        t = k / fps
+        t = float(Fraction(skip + k) / fps)          # local time since the overlay's own start
         im = Image.new('RGBA', (W, H), (0, 0, 0, 0))
         dr = ImageDraw.Draw(im)
         if o['type'] == 'text_slam':
@@ -388,8 +396,113 @@ def overlay_frames(o, W, H, fps, d):
                 im = Image.alpha_composite(im, Image.new('RGBA', (W, H), (255, 255, 255, int(220 * (1 - t / 0.12)))))
         elif o['type'] == 'flash':
             im = Image.new('RGBA', (W, H), (255, 255, 255, int(255 * max(0, 1 - t / o['dur']))))
-        im.save(d / f'{k:05d}.png')
-    return n
+        yield im
+
+
+def render_video(edl, work):
+    """Segments -> concat -> overlays -> end fade: work/video.mp4 with exactly Q(duration) frames."""
+    W, H = edl['size']
+    fps = M.frac(edl['fps'])
+    dur = edl['duration']
+    total = M.Q(dur, fps)
+    parts = []
+    for i, s in enumerate(edl['segments']):
+        parts.append(render_segment(s, i, edl, work)[0])
+        print(f"seg {i:2d} {s['at']:7.3f}+{s['dur']:.3f} {s.get('note', '')}", flush=True)
+    (work / 'concat.txt').write_text(''.join(f"file '{p.name}'\n" for p in parts))
+    base = work / 'base.mp4'
+    run(['ffmpeg', '-v', 'error', '-y', '-f', 'concat', '-safe', '0', '-i', work / 'concat.txt', '-c', 'copy', base])
+
+    inputs, fc, last = ['-i', str(base)], [], '[0:v]'
+    for j, o in enumerate(edl.get('overlays', []) or []):
+        q0, n, skip = overlay_span(o, fps)
+        if n <= 0 or q0 >= total:
+            continue
+        if o['type'] == 'layer':      # a ready-made RGBA layer (e.g. lyrics), placed on the frame grid
+            inputs += ['-itsoffset', f'{float(Fraction(q0) / fps) - 1e-4:.6f}', '-i', str(P(o['src']))]
+            pre = f'trim=start_frame={skip},setpts=PTS-STARTPTS+{float(Fraction(q0) / fps):.6f}/TB,' if skip else ''
+        else:
+            mov = work / f'ov{j}.mov'
+            got = M.encode_rgba(overlay_images(o, W, H, fps), W, H, fps, mov)
+            if got != n:
+                raise M.MvrError('render', f'overlays[{j}]', f'drew {got} frames, expected {n}')
+            inputs += ['-itsoffset', f'{float(Fraction(q0) / fps) - 1e-4:.6f}', '-i', str(mov)]
+            pre = ''
+        k = inputs.count('-i') - 1
+        fc.append(f"[{k}:v]{pre}null[l{j}];{last}[l{j}]overlay=eof_action=pass:enable='between(n,{q0},{q0 + n - 1})'[o{j}]")
+        last = f'[o{j}]'
+    ef = edl.get('end_fade', 0)
+    fc.append(f"{last}fade=t=out:st={dur - ef:.6f}:d={ef}[v]" if ef else f'{last}null[v]')
+    video = work / 'video.mp4'
+    run(['ffmpeg', '-v', 'error', '-y', *inputs, '-filter_complex', ';'.join(fc), '-map', '[v]', '-an',
+         '-c:v', 'libx264', '-preset', 'medium', '-crf', '18', '-pix_fmt', 'yuv420p', '-r', str(fps),
+         '-frames:v', str(total), video])
+    return video
+
+
+def render_audio(edl, work, gain_db, limit_db, attempt):
+    """Song -> trimmed, faded, gained, limited 48 kHz PCM. Do NOT put loudnorm in the video graph:
+    in dynamic mode it once left a 3 s hole in the AAC timestamps (the first sung line went silent).
+    The limiter runs 4x oversampled (closer to true peak) with latency compensation, so the PCM
+    keeps its timing (alimiter without latency=true delays the signal by its attack time)."""
+    dur = edl['duration']
+    ef = edl.get('end_fade', 0)
+    fade = max(ef, 0.5) if dur > 1 else 0
+    af = f'atrim=0:{dur},asetpts=PTS-STARTPTS' + (f',afade=t=out:st={dur - fade:.6f}:d={fade}' if fade else '')
+    if gain_db is not None:
+        lin = 10 ** (limit_db / 20)
+        af += (f',volume={gain_db:.3f}dB,aresample=192000,alimiter=limit={lin:.5f}:attack=5:release=50:level=false'
+               f':latency=true,aresample=48000')
+    else:
+        af += ',aresample=48000'
+    wav = work / f'audio{attempt}.wav'
+    run(['ffmpeg', '-v', 'error', '-y', '-i', P(edl['song']), '-vn', '-af', af, '-c:a', 'pcm_s24le', wav])
+    return wav, af
+
+
+def mux(video, wav, out):
+    run(['ffmpeg', '-v', 'error', '-y', '-i', video, '-i', wav, '-map', '0:v', '-map', '1:a', '-c:v', 'copy',
+         '-c:a', 'aac', '-b:a', '256k', '-movflags', '+faststart', out])
+
+
+def audio_and_mux(edl, work, video, candidate, allow_miss, warnings):
+    """Render audio, mux, and (with a loudness target) iterate up to 3 times on the measured final AAC."""
+    L = edl.get('loudness')
+    tol = QA.tolerances(edl)
+    attempts = []
+    if not L:
+        wav, af = render_audio(edl, work, None, None, 0)
+        mux(video, wav, candidate)
+        return wav, {'target': None, 'attempts': []}
+    pre = f"atrim=0:{edl['duration']},asetpts=PTS-STARTPTS"
+    src = M.loudness(P(edl['song']), pre)
+    if src['I'] is None:
+        msg = f"song loudness {src['status']}: {src['reason']}"
+        if not allow_miss:
+            raise M.MvrError('loudness', 'song', msg + ' (no gain can be computed; pass --allow-loudness-miss to render without normalisation)')
+        warnings.append(msg + '; rendered without normalisation (--allow-loudness-miss)')
+        wav, _ = render_audio(edl, work, None, None, 0)
+        mux(video, wav, candidate)
+        return wav, {'target': L, 'source': src, 'attempts': [], 'normalised': False}
+    gain, limit = L['I'] - src['I'], L['TP'] - 0.3
+    for k in range(3):
+        wav, af = render_audio(edl, work, gain, limit, k)
+        mux(video, wav, candidate)
+        fin = M.loudness(candidate)
+        pcm = M.loudness(wav)
+        attempts.append({'gain_db': round(gain, 3), 'limit_dbtp': round(limit, 3), 'pcm': pcm, 'final': fin})
+        if fin['I'] is None:
+            break
+        ok_i = abs(fin['I'] - L['I']) <= tol['loudness_I_tol']
+        ok_tp = fin['TP'] is not None and fin['TP'] <= L['TP'] + tol['true_peak_tol']
+        print(f"loudness attempt {k + 1}: gain {gain:+.2f} dB, ceiling {limit:.2f} dBTP -> "
+              f"I {fin['I']} LUFS, TP {fin['TP']} dBTP", flush=True)
+        if ok_i and ok_tp:
+            break
+        if not ok_tp and fin['TP'] is not None:
+            limit -= (fin['TP'] - L['TP']) + 0.1
+        gain += L['I'] - fin['I']
+    return wav, {'target': L, 'source': src, 'attempts': attempts, 'normalised': True}
 
 
 def main():
@@ -397,79 +510,74 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('edl', help='edit decision list (JSON)')
     ap.add_argument('--root', default='.', help='folder that relative paths in the EDL resolve against')
+    ap.add_argument('--replace', action='store_true', help='replace an existing output once the new one passes QA')
+    ap.add_argument('--keep-work', action='store_true', help='keep this run\'s temporary folder for debugging')
+    ap.add_argument('--allow-loudness-miss', action='store_true',
+                    help='publish even if the loudness target is missed; the deviation is recorded in the report')
     a = ap.parse_args()
     ROOT = Path(a.root).expanduser().resolve()
-    edl_path = Path(a.edl)
-    edl = json.loads(edl_path.read_text())
-    W, H = edl['size']
-    fps, dur = edl['fps'], edl['duration']
-    work = P(edl['work_dir'])
-    if work in (ROOT, Path.home(), Path('/')) or work in ROOT.parents or edl_path.resolve().is_relative_to(work):
-        sys.exit(f'work_dir {work} would delete the root, your home or the EDL itself; use a scratch folder')
-    if work.exists():
-        shutil.rmtree(work)
-    work.mkdir(parents=True)
-
-    segs = edl['segments']
-    t = 0.0
-    for i, s in enumerate(segs):
-        if abs(s['at'] - t) > 1e-3:
-            sys.exit(f'segment {i} starts at {s["at"]}, expected {t:.3f} (segments must be contiguous)')
-        t = s['at'] + s['dur']
-    if abs(t - dur) > 1e-3:
-        sys.exit(f'segments end at {t:.3f}, duration is {dur}')
-
-    parts = []
-    for i, s in enumerate(segs):
-        parts.append(render_segment(s, i, edl, work)[0])
-        print(f"seg {i:2d} {s['at']:6.2f}+{s['dur']:.2f} {s.get('note', '')}", flush=True)
-    (work / 'concat.txt').write_text(''.join(f"file '{p.name}'\n" for p in parts))
-    base = work / 'base.mp4'
-    run(['ffmpeg', '-v', 'error', '-y', '-f', 'concat', '-safe', '0', '-i', str(work / 'concat.txt'), '-c', 'copy', str(base)])
-
-    inputs, fc, last = ['-i', str(base)], [], '[0:v]'
-    for j, o in enumerate(edl.get('overlays', [])):
-        if o['type'] == 'layer':      # a ready-made RGBA layer (e.g. lyrics), placed at `at`
-            mov = P(o['src'])
-        else:
-            d = work / f'ov{j}'
-            overlay_frames(o, W, H, fps, d)
-            mov = work / f'ov{j}.mov'
-            run(['ffmpeg', '-v', 'error', '-y', '-framerate', str(fps), '-i', str(d / '%05d.png'), '-c:v', 'qtrle', str(mov)])
-            shutil.rmtree(d)
-        inputs += ['-itsoffset', f"{o['at']:.4f}", '-i', str(mov)]
-        fc.append(f"{last}[{j + 1}:v]overlay=eof_action=pass:enable='between(t,{o['at']:.4f},{o['at'] + o['dur']:.4f})'[o{j}]")
-        last = f'[o{j}]'
-    ef = edl.get('end_fade', 0)
-    fc.append(f"{last}fade=t=out:st={dur - ef:.3f}:d={ef}[v]" if ef else f'{last}null[v]')
-
-    # Audio is rendered to its own WAV first and muxed afterwards. Do not put loudnorm inside the
-    # video filter graph: in dynamic mode it once left a 3 s hole in the AAC timestamps (0.68–3.67 s,
-    # the first sung line went silent). Loudness is a flat gain plus a
-    # peak limiter, not loudnorm's dynamic mode, which lifted the start ~3 dB more than the end.
-    song = P(edl['song'])
-    af = f'atrim=0:{dur},afade=t=out:st={dur - max(ef, 0.5):.3f}:d={max(ef, 0.5)}'
-    if edl.get('loudness'):
-        L = edl['loudness']
-        r = subprocess.run(['ffmpeg', '-hide_banner', '-i', str(song), '-af',
-                            f"{af},loudnorm=I={L['I']}:TP={L['TP']}:LRA=11:print_format=json", '-f', 'null', '-'],
-                           capture_output=True, text=True).stderr
-        m = json.loads(r[r.rfind('{'):r.rfind('}') + 1])
-        gain = L['I'] - float(m['input_i'])
-        limit = 10 ** ((L['TP'] - 0.5) / 20)   # sample-peak ceiling with headroom for inter-sample peaks
-        if float(m['input_tp']) + gain > L['TP']:
-            print(f"loudness: +{gain:.2f} dB puts peaks over {L['TP']} dBTP; a limiter shaves about "
-                  f"{float(m['input_tp']) + gain - L['TP'] + 0.5:.1f} dB off the loudest peaks; say so in the report", flush=True)
-        af += f',volume={gain:.2f}dB,alimiter=limit={limit:.4f}:attack=5:release=50:level=false'
-    wav = work / 'audio.wav'
-    run(['ffmpeg', '-v', 'error', '-y', '-i', str(song), '-af', f'{af},aresample=48000', '-c:a', 'pcm_s24le', str(wav)])
+    edl_path = Path(a.edl).resolve()
+    try:
+        edl = M.load_json(edl_path)
+        if not isinstance(edl, dict):
+            raise ValueError('top level must be an object')
+    except (ValueError, OSError) as e:
+        M.die(f'[validate] {a.edl}: {e}')
+    try:
+        res = V.validate(edl, ROOT, edl_path)
+    except M.MvrError as e:
+        M.die(e)
+    for w in res['warnings']:
+        print('warning:', w, file=sys.stderr)
+    if res['errors']:
+        for e in res['errors']:
+            print('error: [validate]', e, file=sys.stderr)
+        sys.exit(2)
     out = P(edl['out'])
-    out.parent.mkdir(parents=True, exist_ok=True)
-    nidx = len(edl.get('overlays', [])) + 1
-    run(['ffmpeg', '-v', 'error', '-y', *inputs, '-i', str(wav), '-filter_complex', ';'.join(fc),
-         '-map', '[v]', '-map', f'{nidx}:a', '-c:v', 'libx264', '-preset', 'medium', '-crf', '18', '-pix_fmt', 'yuv420p',
-         '-r', str(fps), '-frames:v', str(frames(dur, fps)), '-c:a', 'aac', '-b:a', '256k', '-movflags', '+faststart', str(out)])
-    print('wrote', out)
+    if out.exists() and not a.replace:
+        M.die(f'[publish] {out}: already exists; pass --replace to swap it for a new candidate that passes QA')
+    t0 = time.time()
+    warnings = list(res['warnings'])
+    try:
+        with M.output_lock(out), M.run_dir(P(edl['work_dir']), keep=a.keep_work) as work:
+            run_id = work.name
+            candidate = out.parent / f'.{out.stem}.{run_id}.candidate{out.suffix}'
+            report = {'schema_version': M.SCHEMA_VERSION, 'run_id': run_id, 'edl': str(edl_path), 'out': str(out),
+                      'input_fingerprints': M.fingerprint(list(res['plan']['inputs'])),
+                      'tool_versions': M.tool_versions(), 'avoid_checked': res['plan']['avoid_checked']}
+            try:
+                video = render_video(edl, work)
+                wav, audio = audio_and_mux(edl, work, video, candidate, a.allow_loudness_miss, warnings)
+                qa = QA.run_qa(candidate, edl, pcm=wav, allow_loudness_miss=a.allow_loudness_miss)
+                report.update({k: qa[k] for k in ('targets', 'measurements', 'tolerances', 'checks')})
+                report['measurements']['audio_pipeline'] = audio
+                report['warnings'] = warnings + qa['warnings']
+                report['status'] = qa['status']
+                report['seconds'] = round(time.time() - t0, 1)
+                if qa['status'] != 'pass':
+                    rp = out.parent / f'{out.stem}.failed-{run_id}.qa.json'
+                    M.atomic_write_json(rp, report)
+                    failed = [c for c, v in qa['checks'].items() if v['status'] == 'fail']
+                    raise M.MvrError('qa', str(out), f'checks failed: {", ".join(failed)}; nothing published; report {rp}')
+                M.publish(candidate, out, replace=a.replace)
+                M.atomic_write_json(out.parent / f'{out.stem}.qa.json', report)
+                print('wrote', out)
+                print('qa report', out.parent / f'{out.stem}.qa.json')
+            except BaseException as e:
+                if not isinstance(e, M.MvrError) or e.stage != 'qa':
+                    report.update(status='error', error=str(e), warnings=warnings)
+                    try:
+                        M.atomic_write_json(out.parent / f'{out.stem}.failed-{run_id}.qa.json', report)
+                    except Exception:
+                        pass
+                raise
+            finally:
+                if candidate.exists():
+                    candidate.unlink()
+    except M.MvrError as e:
+        M.die(e)
+    except KeyboardInterrupt:
+        M.die('[interrupted] nothing published; the previous output (if any) is unchanged')
 
 
 if __name__ == '__main__':
