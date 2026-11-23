@@ -36,8 +36,11 @@ def is_hex(c):
     return isinstance(c, str) and len(c) == 7 and c[0] == '#' and all(ch in '0123456789abcdefABCDEF' for ch in c[1:])
 
 
-def validate(edl, root, edl_path=None, check_media=True):
-    """Returns {'errors': [...], 'warnings': [...], 'plan': {...}}; never touches the disk except reads."""
+def validate(edl, root, edl_path=None, check_media=True, pending=()):
+    """Returns {'errors': [...], 'warnings': [...], 'plan': {...}}; never touches the disk except reads.
+    `pending`: files a generator is about to create (e.g. the lyric layer); accepted unchecked here and
+    checked again by render_edl when they exist."""
+    pending = {Path(p).resolve() for p in pending}
     root = Path(root).resolve()
     E, W = [], []
     plan = {'segments': [], 'overlays': [], 'inputs': {}, 'frames': None}
@@ -68,6 +71,9 @@ def validate(edl, root, edl_path=None, check_media=True):
             err(where, 'must be a path string')
             return None
         path = M.resolve_path(p, root)
+        if path in pending and not path.exists():
+            inputs.setdefault(str(path), kind)
+            return path
         if not path.is_file():
             err(where, f'{p} does not exist or is not a file')
             return None

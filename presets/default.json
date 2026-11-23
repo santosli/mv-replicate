@@ -1,0 +1,16 @@
+{
+ "_about": "House defaults from real review rounds. A preset is a starting point, not a rule: anything the user asks for in the current MV wins, and a new project may pick other values.",
+ "size": [1280, 720],
+ "fps": 60,
+ "lyric_style": "bubbles",
+ "lyric_set": {"ink": "#3B82F6", "edge": "#0A2463", "neutral": "#FFFFFF", "active": "#8FF0FF", "lift": 22, "tilt": 9, "bubble_time": 0.28, "pop_scale": 0.3},
+ "loudness": {"I": -14.0, "TP": -1.0},
+ "end_fade": 1.5,
+ "habits": {
+  "open_on_a_shot": "frame 0 shows footage, no black open",
+  "text_on_sung_units": "big text pops unit by unit on the sung time, tilted, off faces",
+  "one_credit_place": "credits either in end titles or on a freeze card, not both",
+  "no_starburst": "the full-frame starburst flash was rejected once",
+  "post_credits_gag": "optional; ask before adding one to a new MV"
+ }
+}

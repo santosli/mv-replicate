@@ -608,6 +608,133 @@ class Phase3Audio(Base):
             self.assertTrue(rep['checks']['loudness'].get('deviation_accepted_by_user') or rep['warnings'])
 
 
+# ============================================================== phase 4: generator, versions, smoke
+
+class GenProject(Project):
+    """Project with a clip C, a hand-made beat grid every 0.5 s and lyric unit times."""
+
+    def __init__(self, song_s=6.0, chars=(0.2, 0.4, 0.6)):
+        super().__init__(song_s=song_s)
+        F.numbered_video(self.dir / 'clips/c.mp4', 60, fps='10', start=120)
+        F.write_wav(self.dir / 'song/song.wav', F.music_like(song_s))
+        beats = [round(0.5 * i, 3) for i in range(int(song_s / 0.5))]
+        (self.dir / 'beats.json').write_text(json.dumps(beats))
+        r = sh([PY, SCRIPTS / 'analyze_song.py', self.dir / 'song/song.wav', '--out', self.dir / 'song',
+                '--beats', self.dir / 'beats.json'])
+        assert r.returncode == 0, r.stderr
+        units = ['甲', '乙', '丙']
+        (self.dir / 'song/lyric-chars.json').write_text(json.dumps({'lines': [
+            {'line': '甲乙丙', 'start': 0.1, 'end': 3.0, 'first_char_t': chars[0],
+             'chars': [{'c': u, 't': t, 'source': 'asr'} for u, t in zip(units, chars)]}]}, ensure_ascii=False))
+        shutil.copy(REPO / 'examples/make_edl.py', self.dir / 'make_edl_v1.py')
+
+    def project(self, plan, **kw):
+        cfg = {'song': 'song/song.wav', 'clips': {'A': 'clips/a.mp4', 'B': 'clips/b.mp4', 'C': 'clips/c.mp4'},
+               'avoid': {'B': [[5.0, 5.5]]}, 'grade': 'eq=saturation=1.1', 'plan': plan,
+               'title': {'line': 0, 'units': [0, 1, 2], 'pos': [[0.3, 0.3, -8], [0.5, 0.25, 6], [0.7, 0.31, -5]],
+                         'style': {'size': 0.2, 'fill': '#FFFFFF', 'stroke': '#000000'}}}
+        cfg.update(kw)
+        (self.dir / 'project.json').write_text(json.dumps(cfg, ensure_ascii=False))
+
+    def gen(self, version, *extra):
+        return sh([PY, self.dir / 'make_edl_v1.py', '--work', self.dir, '--version', version, '--project',
+                   self.dir / 'project.json', '--size', '128x72', '--fps', '10', *extra],
+                  cwd=self.p_cwd if hasattr(self, 'p_cwd') else self.base, env={'MV_REPLICATE_DIR': str(REPO)})
+
+
+PLAN_OK = [[None, 'A', 0.0, {}], [2, 'B', 0.0, {}], [6, 'C', 0.0, {'flash_in': 0.1}]]
+
+
+@media
+class Phase4(unittest.TestCase):
+    def tearDown(self):
+        self.g.cleanup()
+
+    def test_T20_title_leaves_before_the_real_cut(self):
+        self.g = GenProject()
+        self.g.project(PLAN_OK)
+        r = self.g.gen('v1')
+        self.assertEqual(r.returncode, 0, r.stderr[-1500:])
+        edl = M.load_json(self.g.dir / 'versions/v1/edl.json')
+        card = next(o for o in edl['overlays'] if o['type'] == 'text_pop')
+        self.assertLessEqual(card['out'] + card['out_dur'], 1.0)     # the real cut, not the beat after 0.6 + 0.6
+        film = F.decode_indices(self.g.dir / 'versions/v1/mv-72p.mp4')
+        self.assertEqual(film[10], 60)                                 # first frame after the cut: clean clip B
+        g2 = GenProject(chars=(0.2, 0.4, 0.9))
+        try:
+            g2.project(PLAN_OK)
+            r = g2.gen('v1')
+            self.assertEqual(r.returncode, 2)
+            self.assertIn('next cut is at 1.000s', r.stderr)
+            self.assertFalse((g2.dir / 'versions/v1/edl.json').exists())
+        finally:
+            g2.cleanup()
+
+    def test_T03_generator_no_render_refuses_a_bad_plan(self):
+        self.g = GenProject()
+        self.g.project([[None, 'A', 0.0, {}], [6, 'B', 0.0, {}], [2, 'C', 0.0, {}]])
+        r = self.g.gen('v1', '--no-render')
+        self.assertEqual(r.returncode, 2)
+        self.assertIn('segments[2]', r.stderr)
+        self.assertFalse((self.g.dir / 'versions/v1/edl.json').exists())
+        self.g.project([[None, 'B', 4.0, {}], [4, 'C', 0.0, {}]])            # B 4.0..6.0 shows 5.0-5.5 (AVOID)
+        r = self.g.gen('v1', '--no-render')
+        self.assertEqual(r.returncode, 2)
+        self.assertIn('avoided range', r.stderr)
+
+    def test_T26_versions_are_isolated(self):
+        self.g = GenProject()
+        self.g.project(PLAN_OK)
+        self.assertEqual(self.g.gen('v1').returncode, 0)
+        v1 = tree_hashes(self.g.dir / 'versions/v1')
+        self.assertEqual(M.load_json(self.g.dir / 'versions/v1/manifest.json')['review']['user_approved'], None)
+        latest = (self.g.dir / 'versions/latest-passing.json').read_text()
+        self.g.project(PLAN_OK, grade='no_such_filter')
+        r = self.g.gen('v2')
+        self.assertNotEqual(r.returncode, 0)
+        r = self.g.gen('v1')
+        self.assertEqual(r.returncode, 2)
+        self.assertIn('already has a film', r.stderr)
+        self.assertEqual(v1, tree_hashes(self.g.dir / 'versions/v1'))
+        self.assertEqual(latest, (self.g.dir / 'versions/latest-passing.json').read_text())
+        self.assertFalse((self.g.dir / 'versions/v2/mv-72p.mp4').exists())
+        self.assertEqual(list((self.g.dir / '.work').iterdir()), [])
+        self.assertTrue({'edl.json', 'lyrics.mov', 'mv-72p.mp4', 'mv-72p.qa.json', 'sheet.jpg', 'manifest.json'}
+                        <= set(os.listdir(self.g.dir / 'versions/v1')))
+
+    @unittest.skipUnless(FONT, 'no CJK font found: set MV_REPLICATE_FONT')
+    def test_T27_styles_layouts_transitions_smoke(self):
+        self.g = GenProject()
+        d = self.g.dir
+        for style in ('karaoke', 'pop', 'terminal', 'bubbles', 'lightbar'):
+            with self.subTest(style):
+                r = sh([PY, SCRIPTS / 'lyric_layer.py', d / 'song/lyric-chars.json', '--style', style, '--duration', 2,
+                        '--size', '128x72', '--fps', 10, '--out', d / f'l-{style}.mov'])
+                self.assertEqual(r.returncode, 0, r.stderr)
+        segs, t = [], 0.0
+        specs = [('A', 0, {'zoom': [1, 1.1], 'focus': [0.3, 0.3]}), ('B', 0, {'punch': 0.3, 'shake': 0.3, 'flash_in': 0.1}),
+                 ('A', 1, {'layout': {'frame': 'vertical', 'pos': 'right'}}), ('B', 1, {'layout': {'frame': 'photo'}}),
+                 ('A', 2, {'rot': 5, 'duotone': ['#14366E', '#5AAEF5', '#F2FBFF']}), ('B', 2, {'whip_out': 0.2}),
+                 ('A', 3, {'whip_in': 0.2}), ('B', 3, {'wipe_in': {'src': 'clips/c.mp4', 'from': 0, 'dur': 0.3}}),
+                 ('A', 4, {'freeze': True}), ('B', None, {'end': 5.0, 'speed': 0.8, 'reverse': True})]
+        for clip, frm, opt in specs:
+            s = {'at': round(t, 3), 'dur': 0.5, 'src': f'clips/{clip.lower()}.mp4', **({'from': frm} if frm is not None else {}), **opt}
+            segs.append(s)
+            t += 0.5
+        style = {'size': 0.3, 'fill': '#FFFFFF', 'stroke': '#1E3A8A', 'marker': '#FFE066'}
+        edl = self.g.edl(segs, duration=5.0, loudness={'I': -14, 'TP': -1}, end_fade=0.5, overlays=[
+            {'type': 'text_slam', 'at': 0.5, 'dur': 0.5, 'text': 'AB'},
+            {'type': 'starburst', 'at': 1.0, 'dur': 0.3}, {'type': 'flash', 'at': 1.5, 'dur': 0.2},
+            {'type': 'text_pop', 'at': -0.1, 'dur': 1.0, 'out': 0.7, 'exit': 'whip', 'pop_from': 1.6, 'style': style,
+             'pieces': [{'text': '甲', 'at': 0.0, 'x': 0.4, 'y': 0.4}, {'text': '乙', 'at': 0.2, 'x': 0.6, 'y': 0.4}]},
+            {'type': 'layer', 'src': 'l-bubbles.mov', 'at': 0, 'dur': 2}])
+        self.g.write(edl)
+        r = self.g.render()
+        self.assertEqual(r.returncode, 0, r.stderr[-1500:])
+        self.assertEqual(M.load_json(d / 'out/film.qa.json')['status'], 'pass')
+        self.assertIn('cut off', r.stderr)      # the negative pre-roll warning
+
+
 def main():
     ids = [a for a in sys.argv[1:] if a.upper().startswith('T') and a[1:].isdigit()]
     rest = [a for a in sys.argv[1:] if a not in ids]

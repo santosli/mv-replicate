@@ -1,0 +1,20 @@
+{
+ "_about": "Per-MV configuration and records. Overrides the defaults inside make_edl.py. Keep this file with the MV, not in the skill.",
+ "song": "song/song.wav",
+ "clips": {"A": "clips/a.mp4", "B": "clips/b.mp4", "C": "clips/c.mp4"},
+ "avoid": {"B": [[2.0, 2.6]]},
+ "grade": "eq=saturation=1.2:contrast=1.04:brightness=0.01",
+ "plan": [
+  [null, "A", 0.0, {"note": "frame 0 is a real shot"}],
+  [4, "B", 0.0, {"note": "intro"}],
+  [8, "C", {"end": 4.0}, {"flash_in": 0.15, "note": "new section: white flash"}]
+ ],
+ "title": {"line": 0, "units": [0, 1, 2], "pos": [[0.3, 0.3, -8], [0.5, 0.25, 6], [0.7, 0.31, -5]],
+           "style": {"size": 0.2, "fill": "#FFF7C2", "fill2": "#FFC21A", "stroke": "#C2410C", "glow": "#FF9F1C", "shadow": "#3B1600"}},
+ "records": {
+  "chosen_lyric_style": "bubbles, blue (user picked it from five 8 s samples)",
+  "hand_set_lyric_times": "song/lyric-overrides.json",
+  "approved_version": null,
+  "exceptions": ["this song starts singing at once, so the title card sits on the first shot without a person"]
+ }
+}

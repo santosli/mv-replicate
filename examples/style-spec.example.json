@@ -1,0 +1,18 @@
+{
+ "_about": "Reference style rules mapped to the target edit and to the evidence that checks them. Update status from the actual output, not from what the EDL asks for.",
+ "reference": "reference.mp4 (analysed only; never shown in the film)",
+ "rules": [
+  {"id": "R1", "ref_range": [12.4, 12.6], "music": "section entry (chorus downbeat)",
+   "technique": "white flash into the new section", "params": {"flash_in": 0.15, "beats": 0},
+   "target": {"segments": [4]}, "evidence": {"sheet": "frame_sheet --dense 7.01 --span 0.3 --step 1"},
+   "status": "implemented", "verified_by_playback_with_sound": false},
+  {"id": "R2", "ref_range": [20.0, 24.0], "music": "hook, one cut per beat", "technique": "cut density 1 per beat",
+   "params": {"beats_per_shot": 1, "repeat": 8}, "target": {"segments": [10, 11, 12, 13]},
+   "evidence": {"cut_count": 8}, "status": "approximate", "reason": "only 4 usable shots; the same clip is cut into pieces with flashes"},
+  {"id": "R3", "ref_range": [31.0, 31.5], "music": "accent", "technique": "speed lines drawn into the animation",
+   "status": "unsupported", "reason": "drawn inside the reference frames; not an editing technique"},
+  {"id": "R4", "ref_range": [0.0, 1.8], "music": "intro", "technique": "black open",
+   "status": "preference_override", "reason": "house preset: open on a shot at frame 0"}
+ ],
+ "status_values": ["implemented", "approximate", "missing_footage", "unsupported", "preference_override"]
+}
