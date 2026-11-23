@@ -10,7 +10,7 @@ between inputs, the work folder and the output. render_edl.py runs the same chec
 
 Exit code 0: valid (warnings allowed). 1: errors. Messages name the segment / overlay / field.
 """
-import argparse, math, os, sys
+import argparse, copy, math, os, sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -41,6 +41,7 @@ def validate(edl, root, edl_path=None, check_media=True, pending=()):
     `pending`: files a generator is about to create (e.g. the lyric layer); accepted unchecked here and
     checked again by render_edl when they exist."""
     pending = {Path(p).resolve() for p in pending}
+    edl = copy.deepcopy(edl)       # annotate a copy; the caller's EDL is written out unchanged
     root = Path(root).resolve()
     E, W = [], []
     plan = {'segments': [], 'overlays': [], 'inputs': {}, 'frames': None}

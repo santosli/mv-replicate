@@ -20,6 +20,7 @@ import fixtures as F          # noqa: E402
 import mvr_common as M        # noqa: E402
 
 PY = sys.executable
+os.environ['MV_REPLICATE_CACHE'] = tempfile.mkdtemp(prefix='mvr-cache-')   # never the user's cache
 HAVE_FFMPEG = shutil.which('ffmpeg') is not None and shutil.which('ffprobe') is not None
 FONT = os.environ.get('MV_REPLICATE_FONT') or next(
     (str(p) for p in [Path('~/Library/Fonts/HarmonyOS_Sans_SC_Black.ttf').expanduser(),
@@ -121,22 +122,19 @@ class Phase1(Base):
             self.assertNotEqual(r.returncode, 0)
             self.assertIn('out', r.stderr)
             self.assertEqual(before, tree_hashes(self.p.dir / 'clips'))
-        # same final target: the second run is refused while the first holds the lock
+        # same final target: while another process holds the output lock, a run is refused
+        import fcntl
         self.p.write(self.p.edl(out='out/same.mp4'))
-        a = subprocess.Popen([PY, SCRIPTS / 'render_edl.py', 'edl.json', '--root', '.'], cwd=self.p.dir,
-                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                             env={**os.environ, 'MV_REPLICATE_FONT': FONT or ''})
-        lock = self.p.dir / 'out/.same.mp4.lock'
-        for _ in range(200):
-            if lock.exists():
-                break
-            time.sleep(0.05)
-        time.sleep(0.3)
-        b = self.p.render()
-        sa = a.communicate(timeout=300)
-        self.assertEqual(a.returncode, 0, sa[1][-800:])
+        (self.p.dir / 'out').mkdir(exist_ok=True)
+        with open(self.p.dir / 'out/.same.mp4.lock', 'a+') as lk:
+            fcntl.flock(lk.fileno(), fcntl.LOCK_EX)
+            b = self.p.render()
         self.assertNotEqual(b.returncode, 0)
-        self.assertTrue('another run' in b.stderr or 'already exists' in b.stderr, b.stderr)
+        self.assertIn('another run', b.stderr)
+        self.assertFalse((self.p.dir / 'out/same.mp4').exists())
+        self.ok(self.p.render())                                  # lock released: the run goes through
+        b = self.p.render()
+        self.assertIn('already exists', b.stderr)
         good = hashlib.sha256((self.p.dir / 'out/same.mp4').read_bytes()).hexdigest()
         # a failing replacement leaves the published film untouched
         self.p.write(self.p.edl(out='out/same.mp4', grade='no_such_filter'))
@@ -429,6 +427,17 @@ class Phase2Lyrics(unittest.TestCase):
         self.assertEqual([(c['c'], c['t']) for c in self.result()['lines'][0]['chars']], [('Hello', 0.0), ('world', 1.0)])
         r = self.run_lc([{'start': 0, 'line': 'Hello world'}], [('Hello', 0.0, 0.0), ('world', 1.0, 1.0)])
         self.assertEqual([(c['c'], c['t']) for c in self.result()['lines'][0]['chars']], [('Hello', 0.0), ('world', 1.0)])
+        # a Latin word heard as a CJK homophone keeps its own slot (not its letters spread over neighbours)
+        r = self.run_lc([{'start': 0, 'line': '海洋'}, {'start': 1.1, 'line': '改完 Bug 算高数'}],
+                        [('海', 0.5, 0.5), ('洋', 0.8, 0.8), ('盖', 1.2, 1.2), ('湾', 1.5, 1.5), ('不', 2.0, 2.0),
+                         ('算', 2.2, 2.2), ('高', 2.5, 2.5), ('速', 2.8, 2.8)])
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual([(c['c'], c['t']) for c in self.result()['lines'][1]['chars']][:4],
+                         [('改', 1.2), ('完', 1.5), ('Bug', 2.0), ('算', 2.2)])
+        # a Latin word split by the ASR into letters takes the first piece's time
+        r = self.run_lc([{'start': 0, 'line': '互搏 CPU 疯'}], [('互', 0.1, 0.1), ('帮', 0.3, 0.3), ('C', 0.5, 0.5), ('B', 0.7, 0.7), ('疯', 0.9, 0.9)])
+        self.assertEqual([(c['c'], c['t']) for c in self.result()['lines'][0]['chars']],
+                         [('互', 0.1), ('搏', 0.3), ('CPU', 0.5), ('疯', 0.9)])
 
     def test_T18_edge_lines_conflicts_overrides(self):
         lines = [{'start': 0, 'line': '你好'}, {'start': 2, 'line': ''}, {'start': 3, 'line': '！！'},
@@ -684,12 +693,16 @@ class Phase4(unittest.TestCase):
 
     def test_T26_versions_are_isolated(self):
         self.g = GenProject()
-        self.g.project(PLAN_OK)
+        outside = self.g.base / 'x' / 'shared-clips'        # clips kept outside the MV folder
+        outside.mkdir()
+        shutil.copy(self.g.dir / 'clips/c.mp4', outside / 'c.mp4')
+        self.g.project(PLAN_OK, clips={'A': 'clips/a.mp4', 'B': str(self.g.dir / 'clips/b.mp4'), 'C': str(outside / 'c.mp4')})
         self.assertEqual(self.g.gen('v1').returncode, 0)
         v1 = tree_hashes(self.g.dir / 'versions/v1')
         self.assertEqual(M.load_json(self.g.dir / 'versions/v1/manifest.json')['review']['user_approved'], None)
         latest = (self.g.dir / 'versions/latest-passing.json').read_text()
-        self.g.project(PLAN_OK, grade='no_such_filter')
+        self.g.project(PLAN_OK, grade='no_such_filter',
+                       clips={'A': 'clips/a.mp4', 'B': str(self.g.dir / 'clips/b.mp4'), 'C': str(outside / 'c.mp4')})
         r = self.g.gen('v2')
         self.assertNotEqual(r.returncode, 0)
         r = self.g.gen('v1')
@@ -699,8 +712,31 @@ class Phase4(unittest.TestCase):
         self.assertEqual(latest, (self.g.dir / 'versions/latest-passing.json').read_text())
         self.assertFalse((self.g.dir / 'versions/v2/mv-72p.mp4').exists())
         self.assertEqual(list((self.g.dir / '.work').iterdir()), [])
+        # an interrupted v2 (Ctrl-C to the whole process group, as in a terminal) leaves v1 alone
+        import signal
+        self.g.project(PLAN_OK, clips={'A': 'clips/a.mp4', 'B': str(self.g.dir / 'clips/b.mp4'), 'C': str(outside / 'c.mp4')})
+        proc = subprocess.Popen([PY, self.g.dir / 'make_edl_v1.py', '--work', self.g.dir, '--version', 'v3', '--project',
+                                 self.g.dir / 'project.json', '--size', '128x72', '--fps', '10'], cwd=self.g.base,
+                                env={**os.environ, 'MV_REPLICATE_DIR': str(REPO), 'MV_REPLICATE_FONT': FONT or ''},
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
+        work = self.g.dir / '.work'
+        for _ in range(400):
+            if any(work.glob('run-*')):
+                break
+            time.sleep(0.02)
+        os.killpg(proc.pid, signal.SIGINT)
+        proc.communicate(timeout=120)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertFalse((self.g.dir / 'versions/v3/mv-72p.mp4').exists())
+        self.assertEqual(v1, tree_hashes(self.g.dir / 'versions/v1'))
+        self.assertEqual(latest, (self.g.dir / 'versions/latest-passing.json').read_text())
+        self.assertEqual(list(work.glob('run-*')), [], 'interrupted run left its temp folder')
+        self.assertFalse(list((self.g.dir / 'versions/v3').glob('.*candidate*')))
         self.assertTrue({'edl.json', 'lyrics.mov', 'mv-72p.mp4', 'mv-72p.qa.json', 'sheet.jpg', 'manifest.json'}
                         <= set(os.listdir(self.g.dir / 'versions/v1')))
+        fps_ = M.load_json(self.g.dir / 'versions/v1/manifest.json')['input_fingerprints']
+        self.assertIsNotNone(fps_[str(outside / 'c.mp4')])
+        self.assertIsNotNone(fps_[str(self.g.dir / 'clips/b.mp4')])
 
     @unittest.skipUnless(FONT, 'no CJK font found: set MV_REPLICATE_FONT')
     def test_T27_styles_layouts_transitions_smoke(self):

@@ -9,10 +9,11 @@ put the first sung syllable 0.8 s early and drifted by a syllable inside lines.
 Method (references/conventions.md):
   1. Every whisper text token must carry a finite t_dtw >= 0 (default) - otherwise this stops and names
      the token. `--time offsets` uses offsets.from instead and says so in `timing_source`.
-  2. Tokens are split into characters; a multi-character token spreads its characters up to the next
-     token (source "split"). The lyric text is aligned to those characters (Needleman-Wunsch, same
-     character +2, different 0, gap -1). A display unit (one CJK character, or a whole Latin word or
-     number) takes the time of its first character.
+  2. Lyric and ASR are both cut into units: one CJK character each, a Latin word / number whole. An
+     ASR token holding several units spreads them up to the next token (source "split"). The units
+     are aligned (Needleman-Wunsch: equal +2; Latin units where one is a prefix of the other, e.g.
+     "Hello" / "hel" or "CPU" / "C", +1; anything else 0, so a homophone still lends its time;
+     gap -1). Each lyric unit takes the time of the ASR unit it is paired with.
   3. Per line, a time outside [line start - onset tolerance, next line start) is dropped. Remaining
      ASR times must be non-decreasing; a conflict stops the run (or, with --drop-conflicting-anchors,
      the fewest anchors are dropped). Gaps are filled linearly between the neighbouring reliable times
@@ -69,20 +70,28 @@ def load_tokens(path, mode):
                 if not M.finite(v) or v < 0:
                     fail(where, f'offsets.from is {v!r}')
                 at = v / 1000
-            toks.append((at, PUNCT.sub('', text).lower()))
+            toks.append((at, [u.lower() for u in units_of(text)]))
     if not toks:
         fail(str(path), 'no text tokens')
-    chars = []
-    for i, (at, txt) in enumerate(toks):
-        nxt = toks[i + 1][0] if i + 1 < len(toks) else at + 0.25 * len(txt)
-        step = min(0.3, max(0.0, nxt - at) / len(txt))
-        for k, ch in enumerate(txt):
-            chars.append((at + step * k, ch, 'asr' if k == 0 else 'split'))
-    return chars
+    units = []
+    for i, (at, us) in enumerate(toks):
+        nxt = toks[i + 1][0] if i + 1 < len(toks) else at + 0.25 * len(us)
+        step = min(0.3, max(0.0, nxt - at) / len(us))
+        for k, u in enumerate(us):
+            units.append((at + step * k, u, 'asr' if k == 0 else 'split'))
+    return units
+
+
+def score(a, b):
+    if a == b:
+        return 2
+    if a.isascii() and b.isascii() and a.isalnum() and b.isalnum() and (a.startswith(b) or b.startswith(a)):
+        return 1
+    return 0
 
 
 def align(a, b):
-    """Needleman-Wunsch over characters; returns the matched index in b (or None) for each item of a."""
+    """Needleman-Wunsch over units; returns the matched index in b (or None) for each item of a."""
     n, m = len(a), len(b)
     S = [[0] * (m + 1) for _ in range(n + 1)]
     for i in range(1, n + 1):
@@ -92,10 +101,10 @@ def align(a, b):
     for i in range(1, n + 1):
         ai, Si, Sp = a[i - 1], S[i], S[i - 1]
         for j in range(1, m + 1):
-            Si[j] = max(Sp[j - 1] + (2 if ai == b[j - 1] else 0), Sp[j] - 1, Si[j - 1] - 1)
+            Si[j] = max(Sp[j - 1] + score(ai, b[j - 1]), Sp[j] - 1, Si[j - 1] - 1)
     out, i, j = [None] * n, n, m
     while i and j:
-        if S[i][j] == S[i - 1][j - 1] + (2 if a[i - 1] == b[j - 1] else 0):
+        if S[i][j] == S[i - 1][j - 1] + score(a[i - 1], b[j - 1]):
             out[i - 1] = j - 1
             i, j = i - 1, j - 1
         elif S[i][j] == S[i - 1][j] - 1:
@@ -177,18 +186,16 @@ def run(a):
         return
 
     toks = load_tokens(a.whisper, a.time)
-    flat, owner = [], []          # lyric characters and their (line, unit, position in unit)
+    flat, owner = [], []          # lyric units and their (line, unit)
     for i, ln in enumerate(lines):
         for k, u in enumerate(ln['units']):
-            for p, ch in enumerate(u.lower()):
-                flat.append(ch)
-                owner.append((i, k, p))
-    match = align(flat, [c for _, c, _ in toks])
+            flat.append(u.lower())
+            owner.append((i, k))
+    match = align(flat, [u for _, u, _ in toks])
     first = {}
     for f, j in enumerate(match):
-        i, k, p = owner[f]
-        if p == 0 and j is not None:
-            first[(i, k)] = (toks[j][0], toks[j][2])
+        if j is not None:
+            first[owner[f]] = (toks[j][0], toks[j][2])
 
     overrides = {}
     if a.overrides:
@@ -286,7 +293,7 @@ def run(a):
 
     res = {'schema_version': M.SCHEMA_VERSION, 'source': str(a.whisper), 'timing_source': a.time,
            'onset_tolerance': a.onset_tolerance,
-           'units': 'CJK character or whole Latin word/number; time of its first character',
+           'units': 'CJK character or whole Latin word/number, aligned unit to unit',
            'inputs': {'whisper_sha256': M.sha256(a.whisper), 'lyrics_sha256': lyrics_sha,
                       'overrides': {'path': str(a.overrides), 'sha256': M.sha256(a.overrides)} if a.overrides else None},
            'stats': stats, 'lines': out_lines}

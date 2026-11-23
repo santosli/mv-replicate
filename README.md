@@ -91,12 +91,13 @@ $PY scripts/compare_lyric_timing.py turbo.json small.json             # 两个�
 
 - `work_dir` 现在是临时目录的**父目录**：每次渲染在里面新建一个子目录，结束只删这个子目录，不再清空 `work_dir` 本身。
 - 已存在的输出默认拒绝覆盖；要替换加 `--replace`，而且新片过 QA 后才替换。
-- 渲染入口会先校验 EDL；不合法的 EDL（段落不连续、负时长、NaN、素材不够长、输出指向输入）不再渲染。
+- 渲染入口会先校验 EDL；不合法的 EDL（段落不连续、负时长、NaN、素材不够长、输出指向输入）不再渲染。新增的限制：段落起点与上一段终点的差必须在 1e-6 秒内；`flash_in`、`shake`、`punch`、`whip_in`、`whip_out` 不能长于所在段；`size` 必须是偶数；叠层短于一帧会报错。
 - 段落帧数改为按累计边界量化（`Q(at + dur) − Q(at)`），整片帧数恒等于 `Q(duration)`。
 - 源帧选择改为"输出第 k 帧显示源时间 `from + k × speed / fps` 时屏幕上的那一帧"；`reverse` 精确倒放所选帧，`freeze` 保持 `from` 时刻的那一帧。
 - `frame_sheet.py --at t` 选 PTS 不大于 t 的最后一帧（以前按 `-ss` 四位小数取，可能拿到下一帧）；`--frames` 按真实解码帧号；任何请求失败默认非零退出，`--lenient` 可以只发布找到的部分。
-- `lyric_chars.py` 默认要求 DTW 时间完整，缺了就报错，不再静默用 offsets；输出每个字多了 `source`；`guessed` 现在也包括多字 token 拆开推算的时间。
+- `lyric_chars.py` 默认要求 DTW 时间完整，缺了就报错，不再静默用 offsets；输出每个字多了 `source`；`guessed` 现在也包括多字 token 拆开推算的时间。英文词按整词与 ASR 对齐，被 ASR 拆成字母的英文词（如 `CPU` → `C`、`B`）不再错位一格。
 - `lyric_layer.py --yield TEXT@T` 只让唱到的那一次让位（以前所有含 TEXT 的句子都被截断）；有歧义时加 `#序号`。
+- 素材的帧表（每帧的真实 PTS）要完整解码才能得到，结果缓存在 `~/.cache/mv-replicate/`（按文件路径、大小、修改时间和 ffprobe 版本区分；`MV_REPLICATE_CACHE` 改位置，设为 `0` 关闭）。
 - `analyze_song.py` 检测不到拍时直接失败，可用 `--beats` 给手工节拍；`--beats-per-bar`、`--bar-phase` 可改。
 - 限幅器改为 4 倍过采样并开启延迟补偿；响度按最终 AAC 测量，达不到目标默认失败。
 - `examples/make_edl.py` 改为按版本输出到 `versions/<版本>/`，计划可以放在 `project.json`；`AVOID` 写进 EDL，由渲染器检查。旧的 `--work` 用法仍可运行，默认版本是 `v1`。

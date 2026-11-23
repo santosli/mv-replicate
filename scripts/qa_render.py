@@ -13,6 +13,8 @@ The overall status is pass only if no check fails and no required check is skipp
 Machine QA passing is not the same as the user approving the cut.
 
   python qa_render.py film.mp4 --edl edl.json [--pcm audio.wav] [--out report.json]
+  python qa_render.py joined.mp4 --duration 75.4 --fps 60 --size 1280x720 [--loudness -14,-1]
+The second form checks a film that has no single EDL, e.g. the main part joined with a credits tail.
 """
 import argparse, json, subprocess, sys
 from fractions import Fraction
@@ -140,11 +142,24 @@ def run_qa(video, edl, pcm=None, allow_loudness_miss=False):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('video')
-    ap.add_argument('--edl', required=True, help='the EDL the video was rendered from (targets and tolerances)')
+    ap.add_argument('--edl', help='the EDL the video was rendered from (targets and tolerances)')
+    ap.add_argument('--duration', type=float, help='without --edl: expected length in seconds')
+    ap.add_argument('--fps', help='without --edl: expected frame rate (number or num/den)')
+    ap.add_argument('--size', help='without --edl: expected WxH')
+    ap.add_argument('--loudness', help='without --edl: target "I,TP", e.g. -14,-1 (omit to skip the loudness check)')
     ap.add_argument('--pcm', help='the PCM WAV that was muxed, for the sync check')
     ap.add_argument('--out', help='write the report here (atomically) as well as printing a summary')
     a = ap.parse_args()
-    edl = M.load_json(a.edl)
+    if a.edl:
+        edl = M.load_json(a.edl)
+    elif a.duration and a.fps and a.size:
+        w, h = map(int, a.size.split('x'))
+        edl = {'duration': a.duration, 'fps': a.fps, 'size': [w, h]}
+        if a.loudness:
+            i, tp = map(float, a.loudness.split(','))
+            edl['loudness'] = {'I': i, 'TP': tp}
+    else:
+        M.die('[qa] give --edl, or --duration, --fps and --size')
     try:
         rep = run_qa(a.video, edl, pcm=a.pcm)
         rep['tool_versions'] = M.tool_versions()

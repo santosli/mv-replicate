@@ -181,22 +181,21 @@ def main():
     subprocess.run([py, str(SCRIPTS / 'frame_sheet.py'), str(film), '--out', str(vdir / 'sheet.jpg'), '--every', '1',
                     '--cell', '240', '--cols', '8'], check=True)
     qa = M.load_json(vdir / f'{film.stem}.qa.json')
-    inputs = [work / cfg['song'], work / 'song/song-analysis.json', lc_path(work)] + [work / p for p in cfg['clips'].values()]
+    # labels are the paths as written in the plan (relative, absolute or ~/...), resolved the same way
+    # the renderer resolves them, so clips kept outside the MV folder are fingerprinted too
+    labels = [cfg['song'], 'song/song-analysis.json', 'song/lyric-chars.json'] + list(cfg['clips'].values())
+    fps_ = {lb: M.fingerprint([M.resolve_path(lb, work)]) for lb in dict.fromkeys(labels)}
     manifest = {'schema_version': M.SCHEMA_VERSION, 'version': a.version, 'edl': str(edl_path.relative_to(work)),
                 'film': str(film.relative_to(work)), 'qa': {'status': qa['status'], 'report': f'{film.stem}.qa.json'},
                 'config': {'size': list(a.size), 'fps': a.fps, 'lyric_style': a.lyric_style, 'preset': a.preset,
                            'project': a.project, 'generator': str(Path(__file__).resolve().name)},
-                'input_fingerprints': {str(Path(k).relative_to(work)): v for k, v in M.fingerprint(inputs).items()},
+                'input_fingerprints': {lb: next(iter(fp.values()), None) for lb, fp in fps_.items()},
                 'edl_sha256': M.sha256(edl_path), 'tool_versions': M.tool_versions(),
                 'review': {'user_approved': None, 'note': 'set by the person who watched it; machine QA is not approval'}}
     M.atomic_write_json(vdir / 'manifest.json', manifest)
     if qa['status'] == 'pass':
         M.atomic_write_json(work / 'versions/latest-passing.json', {'version': a.version, 'film': manifest['film']})
     print('version ready:', vdir)
-
-
-def lc_path(work):
-    return work / 'song/lyric-chars.json'
 
 
 if __name__ == '__main__':

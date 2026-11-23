@@ -97,7 +97,11 @@ def frame_table(path):
         return info['frames']
     if not info['video']:
         raise MvrError('probe', str(path), 'no video stream')
-    r = run(['ffprobe', '-v', 'error', '-select_streams', 'v:0', '-show_entries',
+    cached = _disk_cache(path)
+    if cached:
+        info['frames'] = cached
+        return cached
+    r = run(['ffprobe', '-v', 'error', '-threads', '0', '-select_streams', 'v:0', '-show_entries',
              'frame=best_effort_timestamp,duration', '-of', 'csv=p=0', path])
     if r.returncode:
         raise MvrError('probe', str(path), 'could not decode frames: ' + r.stderr.strip()[-300:])
@@ -125,7 +129,43 @@ def frame_table(path):
                 dur = int(round(1 / (rate * tb))) if rate else 1
             ends.append(p + max(1, dur))
     info['frames'] = (tb, pts, ends)
+    _disk_cache(path, info['frames'])
     return info['frames']
+
+
+def _disk_cache(path, value=None):
+    """Frame tables cost a full decode, so they are cached on disk, keyed by the file's real path, size,
+    modification time and the ffprobe version. MV_REPLICATE_CACHE sets the folder; '0' turns it off."""
+    root = os.environ.get('MV_REPLICATE_CACHE')
+    if root == '0':
+        return None
+    root = Path(root).expanduser() if root else Path(os.environ.get('XDG_CACHE_HOME', '~/.cache')).expanduser() / 'mv-replicate'
+    st = Path(path).stat()
+    key = json.dumps([str(Path(path).resolve()), st.st_size, st.st_mtime_ns, tool_versions_ffprobe()])
+    f = root / 'frames' / (hashlib.sha1(key.encode()).hexdigest() + '.json')
+    try:
+        if value is None:
+            if f.exists():
+                d = json.loads(f.read_text())
+                if d.get('key') == key:
+                    return (Fraction(d['tb']), d['pts'], d['ends'])
+            return None
+        tb, pts, ends = value
+        atomic_write_text(f, json.dumps({'key': key, 'tb': str(tb), 'pts': pts, 'ends': ends}))
+    except (OSError, ValueError, KeyError):
+        return None
+
+
+_FFPROBE_VERSION = []
+
+
+def tool_versions_ffprobe():
+    if not _FFPROBE_VERSION:
+        try:
+            _FFPROBE_VERSION.append(run(['ffprobe', '-version']).stdout.splitlines()[0])
+        except Exception:
+            _FFPROBE_VERSION.append('unknown')
+    return _FFPROBE_VERSION[0]
 
 
 def tick(t, tb):
@@ -372,6 +412,13 @@ def publish(candidate, target, replace=False):
         os.link(candidate, target)       # fails if target exists: no window where it is half-written
     except FileExistsError:
         raise MvrError('publish', str(target), 'already exists; pass --replace to swap it for the new candidate')
+    except OSError:
+        # file systems without hard links (exFAT, some network shares): the caller holds the output
+        # lock, so check-then-rename cannot race with another mv-replicate run
+        if target.exists():
+            raise MvrError('publish', str(target), 'already exists; pass --replace to swap it for the new candidate')
+        os.replace(candidate, target)
+        return
     os.unlink(candidate)
 
 
