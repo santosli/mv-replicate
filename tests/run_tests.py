@@ -195,8 +195,285 @@ class Phase1(Base):
         self.assertEqual(rep['checks']['sync']['lag_samples'], 0)
 
 
+# ============================================================== phase 2: frames, AVOID, lyric timing
+
+def sheet_indices(rep):
+    """Read back the source index painted in each cell of the sheets (not the label)."""
+    from PIL import Image
+    pages = {}
+    out = []
+    for c in rep['cells']:
+        name = rep['sheets'][c['page'] - 1]
+        im = pages.setdefault(name, Image.open(name).convert('RGB'))
+        x, y, w, h = c['box']
+        out.append((c['frame'], F.index_of(im.getpixel((x + w // 2, y + h // 2)))))
+    return out
+
+
+@media
+class Phase2Frames(unittest.TestCase):
+    def setUp(self):
+        self.d = Path(tempfile.mkdtemp(prefix='mvr-fs-'))
+
+    def tearDown(self):
+        shutil.rmtree(self.d, ignore_errors=True)
+
+    def sheet(self, video, *args, ok=True):
+        r = sh([PY, SCRIPTS / 'frame_sheet.py', video, '--out', self.d / 's.jpg', '--json', self.d / 's.json',
+                '--cell', '48', '--cols', '4', *args])
+        if ok:
+            self.assertEqual(r.returncode, 0, r.stderr)
+            return json.loads((self.d / 's.json').read_text())
+        return r
+
+    def test_T05_exact_frames_60_and_ntsc(self):
+        for rate, n in (('60', 120), ('30000/1001', 90)):
+            with self.subTest(rate):
+                v = F.numbered_video(self.d / 'v.mp4', n, fps=rate, codec=('-c:v', 'libx264', '-qp', '0', '-pix_fmt', 'yuv444p', '-g', '5', '-bf', '2'))
+                rep = self.sheet(v, '--frames', '1,4,7')
+                self.assertEqual(sheet_indices(rep), [(1, 1), (4, 4), (7, 7)])
+                tb, pts, _ = M.frame_table(v)
+                self.assertEqual([c['pts'] for c in rep['cells']], [pts[1], pts[4], pts[7]])
+                times = ','.join(repr(float(M.Fraction(pts[i]) * tb)) for i in (1, 4, 7))
+                rep = self.sheet(v, '--at', times)
+                self.assertEqual(sheet_indices(rep), [(1, 1), (4, 4), (7, 7)])
+
+    def test_T06_vfr_by_real_pts(self):
+        v = F.vfr_video(self.d / 'vfr.mp4', [0, 0.5, 1.0, 1.4, 2.0])
+        rep = self.sheet(v, '--at', '1.5')
+        self.assertEqual(sheet_indices(rep), [(3, 3)])
+        self.assertAlmostEqual(rep['cells'][0]['t'], 1.4, places=3)
+        rep = self.sheet(v, '--every', '0.5')
+        self.assertEqual([f for f, _ in sheet_indices(rep)], [0, 1, 2, 3, 4])
+        self.assertEqual([f for f, g in sheet_indices(rep)], [g for f, g in sheet_indices(rep)])
+
+    def test_T07_dense_ends_duplicates_last(self):
+        v = F.numbered_video(self.d / 'v.mp4', 60, fps='10')
+        rep = self.sheet(v, '--dense', '1.0', '--span', '0.25', '--step', '2')
+        self.assertEqual(sheet_indices(rep), [(8, 8), (10, 10), (12, 12)])
+        rep = self.sheet(v, '--ends')
+        self.assertEqual(sheet_indices(rep), [(0, 0), (29, 29), (59, 59)])
+        rep = self.sheet(v, '--at', '0.0,0.05,5.95')
+        self.assertEqual((rep['requests'], rep['unique_frames'], rep['duplicates'], len(rep['failed'])), (3, 2, 1, 0))
+        self.assertEqual(sheet_indices(rep), [(0, 0), (59, 59)])
+
+    def test_T08_bad_crop_bad_file_out_of_range(self):
+        v = F.numbered_video(self.d / 'v.mp4', 20, fps='10')
+        r = self.sheet(v, '--ends', '--crop', '50,0,40,40', ok=False)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn('--crop', r.stderr)
+        bad = self.d / 'broken.mp4'
+        bad.write_bytes(os.urandom(4096))
+        r = self.sheet(bad, '--ends', ok=False)
+        self.assertNotEqual(r.returncode, 0)
+        r = self.sheet(v, '--at', '1.0,9.5', ok=False)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn('9.5', r.stderr)
+        self.assertFalse((self.d / 's.jpg').exists())
+
+    def test_T09_scaled_in_ffmpeg_bounded_pages(self):
+        v = F.numbered_video(self.d / 'v.mp4', 60, fps='10', w=320, h=180)
+        r = sh([PY, SCRIPTS / 'frame_sheet.py', v, '--out', self.d / 'p.jpg', '--json', self.d / 'p.json',
+                '--every', '0.1', '--cell', '32', '--max', '8', '--workers', '2'])
+        self.assertEqual(r.returncode, 0, r.stderr)
+        rep = json.loads((self.d / 'p.json').read_text())
+        self.assertEqual(rep['unique_frames'], 60)
+        self.assertEqual(len(rep['sheets']), 8)
+        self.assertEqual(rep['cell'], [32, 18])
+        self.assertLessEqual(rep['peak_frames_in_memory'], 16)
+        self.assertEqual([f for f, g in sheet_indices(rep)], [g for f, g in sheet_indices(rep)])
+
+
+@media
+class Phase2Avoid(Base):
+    def validate(self, edl):
+        self.p.write(edl, 'v.json')
+        return sh([PY, SCRIPTS / 'validate_edl.py', 'v.json', '--root', '.'], cwd=self.p.dir)
+
+    def test_T10_aliases_and_wipe_input(self):
+        os.symlink(self.p.dir / 'clips/b.mp4', self.p.dir / 'bl.mp4')
+        avoid = {'clips/b.mp4': [[1.0, 2.0]]}
+        cases = {
+            'dotdot': ([{'at': 0, 'dur': 2.0, 'src': 'clips/../clips/b.mp4', 'from': 1.5}], 1),
+            'symlink': ([{'at': 0, 'dur': 2.0, 'src': 'bl.mp4', 'from': 1.5}], 1),
+            'wipe_second_input': ([{'at': 0, 'dur': 2.0, 'src': 'clips/a.mp4', 'from': 0,
+                                    'wipe_in': {'src': 'bl.mp4', 'from': 1.2, 'dur': 0.5}}], 1),
+            'touching_after': ([{'at': 0, 'dur': 2.0, 'src': 'clips/b.mp4', 'from': 2.0}], 0),
+            'touching_before': ([{'at': 0, 'dur': 1.0, 'src': 'clips/b.mp4', 'from': 0.0},
+                                 {'at': 1.0, 'dur': 1.0, 'src': 'clips/a.mp4', 'from': 0}], 0),
+            'unaligned_boundary': ([{'at': 0, 'dur': 1.0, 'src': 'clips/b.mp4', 'from': 0.0},
+                                    {'at': 1.0, 'dur': 1.0, 'src': 'clips/a.mp4', 'from': 0}], 1, {'clips/b.mp4': [[0.95, 2.0]]}),
+        }
+        for name, case in cases.items():
+            with self.subTest(name):
+                segs, want = case[0], case[1]
+                r = self.validate(self.p.edl(segs, avoid=case[2] if len(case) > 2 else avoid))
+                self.assertEqual(r.returncode, want, r.stdout)
+                if want:
+                    self.assertIn('avoided range', r.stdout)
+                    if name == 'wipe_second_input':
+                        self.assertIn('wipe_in', r.stdout)
+        r = self.validate(self.p.edl())
+        self.assertIn('NOT checked', r.stdout)
+
+    def test_T11_one_forbidden_frame_is_caught(self):
+        F.numbered_video(self.p.dir / 'clips/c60.mp4', 120, fps='60')
+        self.p.fps = 60
+        segs = [{'at': 0, 'dur': 1.0, 'src': 'clips/c60.mp4', 'from': 0.0},
+                {'at': 1.0, 'dur': 1.0, 'src': 'clips/a.mp4', 'from': 0.0}]
+        r = self.validate(self.p.edl(segs, avoid={'clips/c60.mp4': [[0.98, 1.5]]}))
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn('source frame 58', r.stdout)
+        r = self.validate(self.p.edl(segs, avoid={'clips/c60.mp4': [[1.0, 1.5]]}))
+        self.assertEqual(r.returncode, 0, r.stdout)
+
+    def test_T12_freeze_checks_the_held_frame(self):
+        segs = [{'at': 0, 'dur': 2.0, 'src': 'clips/a.mp4', 'from': 0.0, 'freeze': True}]
+        self.assertEqual(self.validate(self.p.edl(segs, avoid={'clips/a.mp4': [[1.0, 1.5]]})).returncode, 0)
+        r = self.validate(self.p.edl(segs, avoid={'clips/a.mp4': [[0.0, 0.05]]}))
+        self.assertEqual(r.returncode, 1)
+        self.assertIn('source frame 0', r.stdout)
+
+    def test_T06_render_selection_matches_model_on_vfr_and_ntsc(self):
+        clips = {'vfr': F.vfr_video(self.p.dir / 'vfr.mp4', [0, 0.5, 1.0, 1.4, 2.0, 2.04, 2.1, 2.5]),
+                 'ntsc': F.numbered_video(self.p.dir / 'ntsc.mp4', 60, fps='30000/1001',
+                                          codec=('-c:v', 'libx264', '-qp', '0', '-pix_fmt', 'yuv444p', '-g', '5', '-bf', '2'))}
+        for name, path in clips.items():
+            tb, pts, ends = M.frame_table(path)
+            for start in (0, 0.3333, 1 / 60):
+                for fps, speed in (('60', 1), ('24', 0.9), ('30000/1001', 1.8)):
+                    for rev, frz in ((False, False), (True, False), (False, True)):
+                        with self.subTest(name=name, start=start, fps=fps, speed=speed, rev=rev, frz=frz):
+                            n = 10
+                            exp, why = M.select_frames(tb, pts, ends, start, 1 if frz else n, fps, speed)
+                            self.assertIsNone(why)
+                            exp = (exp * n if frz else exp)[::-1] if rev else (exp * n if frz else exp)
+                            vf = ','.join(M.select_chain(path, start, n, fps, speed, frz, rev))
+                            out = self.p.dir / 'o.mkv'
+                            r = sh(['ffmpeg', '-v', 'error', '-y', *M.source_args(path, start), '-vf', vf,
+                                    '-frames:v', n, '-c:v', 'ffv1', out])
+                            self.assertEqual(r.returncode, 0, r.stderr)
+                            self.assertEqual(F.decode_indices(out), exp)
+
+    def test_T13_reverse_is_exact(self):
+        segs = [{'at': 0, 'dur': 1.0, 'src': 'clips/a.mp4', 'from': 1.0, 'reverse': True},
+                {'at': 1.0, 'dur': 1.0, 'src': 'clips/b.mp4', 'from': 0.0}]
+        self.p.write(self.p.edl(segs))
+        self.ok(self.p.render())
+        got = F.decode_indices(self.p.dir / 'out/film.mp4')
+        self.assertEqual(got[:10], list(range(19, 9, -1)))
+        self.assertEqual(got[10:], list(range(60, 70)))
+
+    def test_T14_freeze_frames_and_layout(self):
+        segs = [{'at': 0, 'dur': 1.0, 'src': 'clips/a.mp4', 'from': 2.0, 'freeze': True},
+                {'at': 1.0, 'dur': 1.0, 'src': 'clips/b.mp4', 'from': 0.55, 'freeze': True,
+                 'layout': {'frame': 'vertical', 'pos': 'center', 'slide': False}}]
+        self.p.write(self.p.edl(segs))
+        self.ok(self.p.render())
+        got = F.decode_indices(self.p.dir / 'out/film.mp4')
+        self.assertEqual(got, [20] * 10 + [65] * 10)
+
+
+class Phase2Lyrics(unittest.TestCase):
+    def setUp(self):
+        self.d = Path(tempfile.mkdtemp(prefix='mvr-ly-'))
+
+    def tearDown(self):
+        shutil.rmtree(self.d, ignore_errors=True)
+
+    def run_lc(self, lines, tokens, *extra, duration=20, raw_whisper=None):
+        (self.d / 'lyrics.json').write_text(json.dumps({'lines': lines}, ensure_ascii=False))
+        if raw_whisper is not None:
+            (self.d / 'w.json').write_text(raw_whisper)
+        else:
+            F.whisper_json(self.d / 'w.json', tokens)
+        return sh([PY, SCRIPTS / 'lyric_chars.py', self.d / 'w.json', '--lyrics', self.d / 'lyrics.json',
+                   '--duration', duration, '--out', self.d / 'out.json', *extra])
+
+    def result(self):
+        return M.load_json(self.d / 'out.json')
+
+    def test_T15_dtw_must_be_valid(self):
+        lines = [{'start': 0, 'line': '你好'}]
+        r = self.run_lc(lines, [('你', None, 0.1), ('好', 0.5, 0.5)])
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("token 0 '你'", r.stderr)
+        self.assertIn('no t_dtw', r.stderr)
+        r = self.run_lc(lines, [('你', -0.01, 0.1), ('好', 0.5, 0.5)])
+        self.assertEqual(r.returncode, 2)
+        self.assertIn('-nfa', r.stderr)
+        r = self.run_lc(lines, [], raw_whisper='{"transcription":[{"tokens":[{"text":"你","t_dtw":NaN,"offsets":{"from":100}},'
+                                              '{"text":"好","t_dtw":50,"offsets":{"from":500}}]}]}')
+        self.assertEqual(r.returncode, 2)
+        self.assertIn('not a finite', r.stderr)
+        r = self.run_lc(lines, [('你', None, 0.1), ('好', None, 0.5)], '--time', 'offsets')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        res = self.result()
+        self.assertEqual(res['timing_source'], 'offsets')
+        self.assertEqual([c['t'] for c in res['lines'][0]['chars']], [0.1, 0.5])
+
+    def test_T16_repair_keeps_anchors_in_order(self):
+        r = self.run_lc([{'start': 10, 'line': '甲乙丙丁'}, {'start': 14, 'line': '戊'}],
+                        [('甲', 8, 8), ('乙', 9, 9), ('丙', 10.5, 10.5), ('丁', 11, 11), ('戊', 14.2, 14.2)])
+        self.assertEqual(r.returncode, 0, r.stderr)
+        ch = self.result()['lines'][0]['chars']
+        ts = [c['t'] for c in ch]
+        self.assertEqual(ts[2:], [10.5, 11.0])
+        self.assertEqual(ts, sorted(ts))
+        self.assertGreaterEqual(ts[0], 10.0)
+        self.assertEqual([c['source'] for c in ch], ['interpolated', 'interpolated', 'asr', 'asr'])
+
+    def test_T17_latin_word_takes_its_first_letter(self):
+        r = self.run_lc([{'start': 0, 'line': 'Hello world'}], [('hel', 0.0, 0.0), ('lo', 0.3, 0.3), ('world', 1.0, 1.0)])
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual([(c['c'], c['t']) for c in self.result()['lines'][0]['chars']], [('Hello', 0.0), ('world', 1.0)])
+        r = self.run_lc([{'start': 0, 'line': 'Hello world'}], [('Hello', 0.0, 0.0), ('world', 1.0, 1.0)])
+        self.assertEqual([(c['c'], c['t']) for c in self.result()['lines'][0]['chars']], [('Hello', 0.0), ('world', 1.0)])
+
+    def test_T18_edge_lines_conflicts_overrides(self):
+        lines = [{'start': 0, 'line': '你好'}, {'start': 2, 'line': ''}, {'start': 3, 'line': '！！'},
+                 {'start': 4, 'line': '啊啊啊'}, {'start': 6, 'line': '再见'}]
+        toks = [('你', 0.1, 0.1), ('好', 0.6, 0.6), ('再', 6.2, 6.2), ('见', 6.7, 6.7)]
+        r = self.run_lc(lines, toks, duration=7.00049)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        res = self.result()
+        self.assertEqual(res['lines'][1]['chars'], [])
+        self.assertEqual(res['lines'][2]['skipped'], 'no displayable characters')
+        mid = res['lines'][3]['chars']
+        self.assertEqual({c['source'] for c in mid}, {'interpolated'})
+        allt = [c['t'] for l in res['lines'] for c in l['chars']]
+        self.assertEqual(allt, sorted(allt))
+        self.assertEqual(res['lines'][-1]['end'], 7.0)
+        r = self.run_lc(lines, toks, '--empty-lines', 'error', duration=7.0)
+        self.assertEqual(r.returncode, 2)
+        # conflicting anchors: stop by default, drop the fewest on request
+        bad = [('你', 0.9, 0.9), ('好', 0.2, 0.2), ('再', 6.2, 6.2), ('见', 6.7, 6.7)]
+        r = self.run_lc(lines[:1] + lines[4:], bad, duration=7)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn('out of order', r.stderr)
+        r = self.run_lc(lines[:1] + lines[4:], bad, '--drop-conflicting-anchors', duration=7)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        t0 = [c['t'] for c in self.result()['lines'][0]['chars']]
+        self.assertEqual(t0, sorted(t0))
+        # overrides: applied, kept on rerun, stale when the lyrics change
+        r = self.run_lc(lines, toks, '--override-template', self.d / 'ov.json', duration=7)
+        ov = json.loads((self.d / 'ov.json').read_text())
+        ov['items'] = [{'line': 3, 'unit': 1, 'c': '啊', 't': 4.9}]
+        (self.d / 'ov.json').write_text(json.dumps(ov, ensure_ascii=False))
+        for _ in range(2):
+            r = self.run_lc(lines, toks, '--overrides', self.d / 'ov.json', duration=7)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            c = self.result()['lines'][3]['chars']
+            self.assertEqual((c[1]['t'], c[1]['source']), (4.9, 'override'))
+            self.assertEqual([x['t'] for x in c], sorted(x['t'] for x in c))
+        lines[3]['line'] = '啊啊哦'
+        r = self.run_lc(lines, toks, '--overrides', self.d / 'ov.json', duration=7)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn('stale', r.stderr)
+
+
 def main():
-    ids = [a for a in sys.argv[1:] if a.upper().startswith('T') and a[1:].isdigit()]
+    ids =[a for a in sys.argv[1:] if a.upper().startswith('T') and a[1:].isdigit()]
     rest = [a for a in sys.argv[1:] if a not in ids]
     loader = unittest.TestLoader()
     suite = unittest.TestSuite()

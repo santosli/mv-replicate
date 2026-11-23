@@ -128,9 +128,15 @@ def frame_table(path):
     return info['frames']
 
 
+def tick(t, tb):
+    """Time in seconds -> nearest time-base tick (half up). Decimal times such as 1/60 s are not exact
+    binary floats; rounding to the tick first makes "exactly on a frame's PTS" mean what it says."""
+    return math.floor(frac(t) / tb + Fraction(1, 2))
+
+
 def cover(pts, tb, t):
-    """Index of the frame on screen at source time t (last frame with pts <= t), or None before the first."""
-    k = bisect_right(pts, math.floor(frac(t) / tb)) - 1
+    """Index of the frame on screen at source time t (last frame with pts <= tick(t)), or None before the first."""
+    k = bisect_right(pts, tick(t, tb)) - 1
     return k if k >= 0 else None
 
 
@@ -152,7 +158,7 @@ def select_frames(tb, pts, ends, start, n, fps, speed=1):
     setpts=trunc((PTS - S) / speed) with S = round(start / tb), then fps=round=up with start_time 0.
     The result is the frame on screen at start + k * speed / fps (to within one time-base tick).
     Returns (indices, None) or (partial, reason) when the source runs out."""
-    S = round(frac(start) / tb)
+    S = tick(start, tb)
     sp = float(frac(speed))
     slots = []
     for p in pts:
@@ -215,7 +221,7 @@ def source_args(path, start):
 def select_chain(path, start, n, fps, speed=1, freeze=False, reverse=False):
     """Filter prefix that yields exactly the frames select_frames() predicts."""
     tb, _, _ = frame_table(path)
-    S = round(frac(start) / tb)
+    S = tick(start, tb)
     sp = float(frac(speed))
     f = [f'setpts=trunc((PTS-{S})/{sp!r})', f'fps={frac(fps)}:start_time=0:round=up']
     if freeze:
