@@ -100,7 +100,11 @@ def run_qa(video, edl, pcm=None, allow_loudness_miss=False):
         if not L:
             checks['loudness'] = check('skipped', reason='no loudness target in the EDL', required=False)
         elif fin['I'] is None or fin['TP'] is None:
-            checks['loudness'] = check('fail', reason=fin['reason'], measured=fin)
+            if allow_loudness_miss:
+                checks['loudness'] = check('pass', deviation_accepted_by_user=True, reason=fin['reason'], measured=fin)
+                warns.append(f"loudness not measurable ({fin['reason']}); accepted with --allow-loudness-miss")
+            else:
+                checks['loudness'] = check('fail', reason=fin['reason'], measured=fin)
         else:
             ok_i = abs(fin['I'] - L['I']) <= tol['loudness_I_tol']
             ok_tp = fin['TP'] <= L['TP'] + tol['true_peak_tol']

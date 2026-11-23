@@ -27,10 +27,12 @@ import os
 from pathlib import Path
 import subprocess
 import sys
-from tempfile import TemporaryDirectory
 from typing import Iterator
 
 from PIL import Image, ImageDraw, ImageFont
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import mvr_common as M  # noqa: E402
 
 
 def default_font():
@@ -355,7 +357,7 @@ def overlay_frames(style_name: str, lyric_json: Path | dict, start: float, end: 
         return Typography(Lyric(line.start, line.end, prefix), (width, height),
                           STYLES[style_name], font_path, lower_left=True)
 
-    for index in range(round((end - start) * fps)):
+    for index in range(M.Q(end, fps) - M.Q(start, fps)):
         layer = Image.new("RGBA", (width, height))
         video_time = start + index / fps
         time = video_time + lead
@@ -374,16 +376,59 @@ def overlay_frames(style_name: str, lyric_json: Path | dict, start: float, end: 
 
 
 
-def yield_to_title(data: dict, text: str, at: float) -> dict:
-    """Cut the line containing `text` just before it and end that line at `at`."""
-    lines = []
-    for ln in data["lines"]:
-        ln = dict(ln)
-        if text in ln["line"]:
-            ln["line"] = ln["line"][:ln["line"].index(text)]
-            ln["chars"] = [c for c in ln["chars"] if c["t"] < at]
-            ln["end"] = round(at, 3)
-        lines.append(ln)
+def char_spans(ln: dict) -> list[int]:
+    """Text position of each sung unit in the line (same walk as parse_line)."""
+    pos, out = 0, []
+    for ch in ln["chars"]:
+        at = ln["line"].index(ch["c"], pos)
+        out.append(at)
+        pos = at + len(ch["c"])
+    return out
+
+
+def yield_candidates(data: dict, text: str) -> list[dict]:
+    """Every occurrence of `text` (in any line) with the time its first sung unit is sung."""
+    cands = []
+    for li, ln in enumerate(data["lines"]):
+        if not ln.get("chars"):
+            continue
+        spans = char_spans(ln)
+        s = ln["line"].find(text)
+        while s >= 0:
+            ks = [k for k, p in enumerate(spans) if s <= p < s + len(text)]
+            if ks:
+                cands.append({"index": len(cands), "line": li, "pos": s, "unit": ks[0],
+                              "t": ln["chars"][ks[0]]["t"], "text": ln["line"]})
+            s = ln["line"].find(text, s + 1)
+    return cands
+
+
+def yield_to_title(data: dict, text: str, at: float, index: int | None = None) -> dict:
+    """The one occurrence of `text` sung nearest `at` (or candidate #index) gives way to a title card:
+    its line is cut before `text` (text, chars and first_char_t together) and ends at `at`.
+    Other occurrences are untouched. Raises ValueError when the choice is missing or ambiguous."""
+    cands = yield_candidates(data, text)
+    listing = "; ".join(f"#{c['index']} line {c['line']} at {c['t']:.2f}s" for c in cands)
+    if not cands:
+        raise ValueError(f"--yield {text}@{at}: no sung occurrence of {text!r}")
+    if index is not None:
+        if not 0 <= index < len(cands):
+            raise ValueError(f"--yield {text}@{at}#{index}: candidates are {listing}")
+        c = cands[index]
+    else:
+        cands_by = sorted(cands, key=lambda c: abs(c["t"] - at))
+        c = cands_by[0]
+        if len(cands_by) > 1 and abs(abs(cands_by[1]["t"] - at) - abs(c["t"] - at)) < 0.05:
+            raise ValueError(f"--yield {text}@{at} is ambiguous ({listing}); add #index, e.g. {text}@{at}#{c['index']}")
+        if abs(c["t"] - at) > 2.0:
+            raise ValueError(f"--yield {text}@{at}: nearest occurrence is sung at {c['t']:.2f}s ({listing})")
+    lines = [dict(ln) for ln in data["lines"]]
+    ln = lines[c["line"]]
+    ln["line"] = ln["line"][:c["pos"]]
+    ln["chars"] = ln["chars"][:c["unit"]]
+    ln["end"] = round(max(at, ln["start"]), 3)
+    ln["first_char_t"] = ln["chars"][0]["t"] if ln["chars"] else None
+    ln["yielded"] = {"text": text, "at": at, "candidate": c["index"]}
     return {**data, "lines": lines}
 
 
@@ -401,11 +446,12 @@ def main() -> None:
     ap.add_argument("lyrics", type=Path, help="lyric-chars.json from lyric_chars.py")
     ap.add_argument("--style", choices=STYLES, default="bubbles")
     ap.add_argument("--set", action="append", default=[], metavar="KEY=VALUE", help="override a style value")
-    ap.add_argument("--yield", dest="yields", action="append", default=[], metavar="TEXT@T")
+    ap.add_argument("--yield", dest="yields", action="append", default=[], metavar="TEXT@T[#k]",
+                    help="the occurrence of TEXT sung nearest T gives way to a title (k picks a listed candidate)")
     ap.add_argument("--start", type=float, default=0.0)
     ap.add_argument("--duration", type=float, required=True)
     ap.add_argument("--size", default="1280x720")
-    ap.add_argument("--fps", type=int, default=60)
+    ap.add_argument("--fps", default="60", help="number or num/den")
     ap.add_argument("--font", type=Path)
     ap.add_argument("--out", type=Path, required=True)
     a = ap.parse_args()
@@ -415,19 +461,32 @@ def main() -> None:
         k, v = kv.split("=", 1)
         style[k] = parse_value(v)
     STYLES["_custom"], PAINTERS["_custom"] = style, PAINTERS[a.style]
-    data = json.loads(a.lyrics.read_text())
-    for y in a.yields:
-        text, at = y.rsplit("@", 1)
-        data = yield_to_title(data, text, float(at))
+    try:
+        data = M.load_json(a.lyrics)
+        for y in a.yields:
+            text, at = y.rsplit("@", 1)
+            index = None
+            if "#" in at:
+                at, k = at.split("#", 1)
+                index = int(k)
+            data = yield_to_title(data, text, float(at), index)
+    except (ValueError, KeyError) as e:
+        M.die(f"[lyric_layer] {e}")
     w, h = map(int, a.size.split("x"))
+    fps = M.frac(a.fps)
     a.out.parent.mkdir(parents=True, exist_ok=True)
-    with TemporaryDirectory(prefix=".lyrics-", dir=a.out.parent) as tmp:
-        for k, im in enumerate(overlay_frames("_custom", data, a.start, a.start + a.duration, w, h, a.fps,
-                                              font_path=a.font)):
-            im.save(Path(tmp) / f"{k:05d}.png", compress_level=1)
-        subprocess.run(["ffmpeg", "-v", "error", "-y", "-framerate", str(a.fps), "-i", str(Path(tmp) / "%05d.png"),
-                        "-c:v", "qtrle", "-pix_fmt", "argb", str(a.out)], check=True)
-    print("wrote", a.out)
+    tmp = a.out.with_name(f".{a.out.stem}.{os.getpid()}.tmp{a.out.suffix}")
+    try:
+        n = M.encode_rgba(overlay_frames("_custom", data, a.start, a.start + a.duration, w, h, fps,
+                                         font_path=a.font), w, h, fps, tmp)
+        os.replace(tmp, a.out)
+    except M.MvrError as e:
+        tmp.unlink(missing_ok=True)
+        M.die(e)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    print("wrote", a.out, f"({n} frames)")
 
 
 if __name__ == "__main__":

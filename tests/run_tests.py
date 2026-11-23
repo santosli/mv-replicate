@@ -472,8 +472,144 @@ class Phase2Lyrics(unittest.TestCase):
         self.assertIn('stale', r.stderr)
 
 
+# ============================================================== phase 3: effects, analysis, audio
+
+class Phase3Yield(unittest.TestCase):
+    def data(self):
+        return {'lines': [
+            {'line': '爱你', 'start': 0.0, 'end': 5.0, 'first_char_t': 0.0,
+             'chars': [{'c': '爱', 't': 0.0}, {'c': '你', 't': 1.0}]},
+            {'line': '爱你', 'start': 10.0, 'end': 12.0, 'first_char_t': 10.0,
+             'chars': [{'c': '爱', 't': 10.0}, {'c': '你', 't': 11.0}]}]}
+
+    def test_T19_yield_only_the_sung_occurrence(self):
+        import lyric_layer as LL
+        d = LL.yield_to_title(self.data(), '你', 11.0)
+        self.assertEqual(d['lines'][0], self.data()['lines'][0])
+        l1 = d['lines'][1]
+        self.assertEqual((l1['line'], [c['c'] for c in l1['chars']], l1['end'], l1['first_char_t']), ('爱', ['爱'], 11.0, 10.0))
+        with self.assertRaises(ValueError) as cm:
+            LL.yield_to_title(self.data(), '爱你', 5.0)
+        self.assertIn('ambiguous', str(cm.exception))
+        d = LL.yield_to_title(self.data(), '爱你', 5.0, index=1)
+        self.assertEqual(d['lines'][1]['chars'], [])
+        self.assertIsNone(d['lines'][1]['first_char_t'])
+        if HAVE_FFMPEG and FONT:
+            tmp = Path(tempfile.mkdtemp(prefix='mvr-yl-'))
+            try:
+                (tmp / 'lc.json').write_text(json.dumps(self.data(), ensure_ascii=False))
+                for spec in ('你@11', '爱你@10'):
+                    r = sh([PY, SCRIPTS / 'lyric_layer.py', tmp / 'lc.json', '--yield', spec, '--duration', 12,
+                            '--size', '128x72', '--fps', 10, '--out', tmp / 'l.mov'])
+                    self.assertEqual(r.returncode, 0, r.stderr)
+                    self.assertEqual(M.Q(12, 10), int(sh(['ffprobe', '-v', 'error', '-count_frames', '-select_streams', 'v:0',
+                                                         '-show_entries', 'stream=nb_read_frames', '-of', 'csv=p=0',
+                                                         tmp / 'l.mov']).stdout))
+            finally:
+                shutil.rmtree(tmp, ignore_errors=True)
+
+
+@media
+class Phase3Analysis(unittest.TestCase):
+    def setUp(self):
+        self.d = Path(tempfile.mkdtemp(prefix='mvr-an-'))
+
+    def tearDown(self):
+        shutil.rmtree(self.d, ignore_errors=True)
+
+    def analyze(self, video, name):
+        r = sh([PY, SCRIPTS / 'analyze_ref.py', video, '--out', self.d / name, '--no-sheet'])
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return M.load_json(self.d / name / 'ref-analysis.json')
+
+    def test_T21_8bit_and_10bit_agree(self):
+        levels = ([0] * 5 + [128] * 5 + [255] * 3 + [128] * 5 + [0] * 5 + [128] * 7) * 2
+        a = self.analyze(F.gray_sequence_video(self.d / 'g8.mp4', levels), 'a8')
+        b = self.analyze(F.gray_sequence_video(self.d / 'g10.mkv', levels, ten_bit=True), 'a10')
+        self.assertEqual(b['info']['format']['pix_fmt'], 'yuv420p10le')
+        self.assertTrue(a['flashes'] and a['black_dips'])
+        self.assertEqual(a['flashes'], b['flashes'])
+        self.assertEqual(a['black_dips'], b['black_dips'])
+        for wa, wb in zip(a['windows'], b['windows']):
+            self.assertLess(abs(wa['luma'] - wb['luma']), 2.0)
+
+    def test_T22_no_audio_no_beats_manual_phase(self):
+        res = self.analyze(F.numbered_video(self.d / 'silent.mp4', 30, fps='10'), 'r')
+        self.assertEqual(res['audio']['status'], 'unavailable')
+        F.write_wav(self.d / 'quiet.wav', [0.0] * 48000 * 3)
+        r = sh([PY, SCRIPTS / 'analyze_song.py', self.d / 'quiet.wav', '--out', self.d / 's'])
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn('--beats', r.stderr)
+        (self.d / 'beats.json').write_text(json.dumps([0.5, 1.0, 1.5, 2.0, 2.5]))
+        r = sh([PY, SCRIPTS / 'analyze_song.py', self.d / 'quiet.wav', '--out', self.d / 's', '--beats', self.d / 'beats.json',
+                '--beats-per-bar', 3, '--bar-phase', 1])
+        self.assertEqual(r.returncode, 0, r.stderr)
+        s = M.load_json(self.d / 's/song-analysis.json')
+        self.assertEqual((s['beats_per_bar'], s['bar_phase'], s['bar_phase_method'], s['beat_source']), (3, 1, 'manual', 'manual'))
+        self.assertEqual([b['bar_beat'] for b in s['beats']], [3, 1, 2, 3, 1])
+        self.assertEqual(s['loudness']['status'], 'unmeasurable')
+        F.write_wav(self.d / 'music.wav', F.music_like(6))
+        r = sh([PY, SCRIPTS / 'analyze_song.py', self.d / 'music.wav', '--out', self.d / 'm'])
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(M.load_json(self.d / 'm/song-analysis.json')['bar_phase_method'], 'onset_strength')
+
+
+@media
+class Phase3Audio(Base):
+    def test_T23_pcm_keeps_its_timing(self):
+        import render_edl as R
+        R.ROOT = self.p.dir
+        edl = self.p.edl(duration=3.0, loudness={'I': -14, 'TP': -1})
+        work = self.p.base / 'w'
+        work.mkdir()
+        src = M.decode_audio(self.p.dir / 'song/song.wav', 48000)
+        wav, _ = R.render_audio(edl, work, 6.0, -1.3, 0)
+        lag = M.lag_samples(src, M.decode_audio(wav, 48000), 960)
+        self.assertLessEqual(abs(lag), 1, f'PCM lag {lag} samples')
+        # the old chain (alimiter without latency compensation) is measurably late
+        old = work / 'old.wav'
+        sh(['ffmpeg', '-v', 'error', '-y', '-i', self.p.dir / 'song/song.wav', '-af',
+            'atrim=0:3,volume=6dB,alimiter=limit=0.84:attack=5:release=50:level=false', old])
+        self.assertGreater(M.lag_samples(src, M.decode_audio(old, 48000), 960), 100)
+
+    def test_T24_loudness_on_final_aac_or_clear_failure(self):
+        F.write_wav(self.p.dir / 'song/peaky.wav', F.peaky(3.0))
+        F.write_wav(self.p.dir / 'song/short.wav', F.music_like(0.3))
+        F.write_wav(self.p.dir / 'song/silent.wav', [0.0] * 48000 * 2)
+        L = {'I': -14, 'TP': -1}
+        # normal music: passes on the decoded AAC
+        self.p.write(self.p.edl(loudness=L, out='out/normal.mp4'))
+        self.ok(self.p.render())
+        rep = M.load_json(self.p.dir / 'out/normal.qa.json')
+        self.assertEqual(rep['checks']['loudness']['status'], 'pass')
+        self.assertLessEqual(abs(rep['measurements']['final_loudness']['I'] + 14), 0.5)
+        self.assertLessEqual(rep['measurements']['final_loudness']['TP'], -0.9)
+        # high peak-to-average: either meets the target or fails with measurements
+        self.p.write(self.p.edl(song='song/peaky.wav', loudness=L, out='out/peaky.mp4'))
+        r = self.p.render()
+        if r.returncode == 0:
+            self.assertEqual(M.load_json(self.p.dir / 'out/peaky.qa.json')['status'], 'pass')
+        else:
+            fails = list((self.p.dir / 'out').glob('peaky.failed-*.qa.json'))
+            self.assertTrue(fails)
+            self.assertIsNotNone(M.load_json(fails[0])['measurements']['final_loudness']['TP'])
+            self.assertFalse((self.p.dir / 'out/peaky.mp4').exists())
+        # silence and too-short audio: refused with a reason, never a NaN gain
+        for song, dur in (('song/silent.wav', 2.0), ('song/short.wav', 0.3)):
+            segs = [{'at': 0, 'dur': dur, 'src': 'clips/a.mp4', 'from': 0}]
+            self.p.write(self.p.edl(segs, song=song, duration=dur, loudness=L, out=f'out/{Path(song).stem}.mp4'))
+            r = self.p.render()
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertIn('loudness', r.stderr)
+            self.assertNotIn('nan', r.stderr.lower())
+            r = self.p.render('edl.json', '--allow-loudness-miss')
+            self.assertEqual(r.returncode, 0, r.stderr)
+            rep = M.load_json(self.p.dir / f'out/{Path(song).stem}.qa.json')
+            self.assertTrue(rep['checks']['loudness'].get('deviation_accepted_by_user') or rep['warnings'])
+
+
 def main():
-    ids =[a for a in sys.argv[1:] if a.upper().startswith('T') and a[1:].isdigit()]
+    ids = [a for a in sys.argv[1:] if a.upper().startswith('T') and a[1:].isdigit()]
     rest = [a for a in sys.argv[1:] if a not in ids]
     loader = unittest.TestLoader()
     suite = unittest.TestSuite()
